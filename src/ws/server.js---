@@ -1,0 +1,2046 @@
+'use strict';
+
+/**
+ * WebSocket game gateway (authoritative turn engine).
+ *
+ * Client -> Server:
+ * - { type:"join_room", tableId:number, token:string }
+ * - { type:"ready", ready:boolean, actionId?:string }
+ * - { type:"start_game", actionId?:string }
+ * - { type:"draw", actionId:string }
+ * - { type:"discard", card:string, actionId:string }
+ * - { type:"declare_finish", discardCard?:string, card?:string, actionId?:string }
+ * - { type:"request_kick", targetUserId:number, reason?:string, actionId?:string }   (admin only)
+ * - { type:"table_reset", tableId:number, actionId?:string }                         (admin only)
+ * - { type:"ping" }
+ *
+ * Server -> Client:
+ * - hello, joined, state_snapshot, player_joined/player_left
+ * - player_disconnected, player_reconnected, player_kicked
+ * - table_paused, table_resumed, table_reset
+ * - ready_ok, ready_state
+ * - hand_start (when >=2 ready)
+ * - state_update (publicState)
+ * - your_hand (private cards for that player)
+ * - action_ack (idempotent ack for actions)
+ * - pong, error
+ *
+ * Notes:
+ * - Player must HTTP-join table first (DB seat allocation).
+ * - Turn flow: DRAW -> DISCARD -> next seat.
+ * - All timestamps are UTC ISO.
+ */
+
+const WebSocket = require('ws');
+const { wsAuthUser } = require('./ws_auth');
+const { Rooms } = require('./ws_rooms');
+const { pool } = require('../db/pool');
+const { findLatestSessionForUserTable, getSessionSnapshot, getSeatForUserInSession } = require('../db/ws_queries');
+const { HandManager } = require('../game/hand_state');
+const { payoutSessionTx } = require('../db/payout_session');
+const { kickPlayerTx, resetRefundTableTx } = require('../db/admin_actions');
+const { EVT, formatCardLog, formatCardListForLog, safeLogEvent, safeCloseRun } = require('../db/table_run_logger');
+
+function nowUtcIso() {
+  return new Date().toISOString();
+}
+
+
+function normalizeSeatIndex(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+
+function eventSeat(ws) {
+  return normalizeSeatIndex(ws && ws._meta ? ws._meta.seatIndex : null);
+}
+
+async function logTableEvent(input) {
+  try { await safeLogEvent(input); } catch (_) {}
+}
+
+
+function debugWs(label, payload) {
+  try {
+    console.info(`[WSDBG] ${label}`, payload);
+  } catch (_) {}
+}
+
+
+/**
+ * Same user (same session) should have only one active WS connection.
+ * Key: `${sessionId}:${userId}`
+ */
+const activeConnByKey = new Map();
+
+// Per-session phase timers (show_finish -> scoring -> finalize)
+const phaseTimers = new Map();
+function clearPhaseTimers(sessionId){
+  const k=String(sessionId);
+  const t=phaseTimers.get(k);
+  if(!t) return;
+  try{ if(t.show) clearTimeout(t.show);}catch{}
+  try{ if(t.finalize) clearTimeout(t.finalize);}catch{}
+  phaseTimers.delete(k);
+}
+
+
+function connKey(sessionId, userId) {
+  return `${sessionId}:${userId}`;
+}
+
+function safeSend(ws, obj) {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+
+function kickReplaced(prevWs) {
+  try {
+    prevWs._meta = prevWs._meta || {};
+    prevWs._meta._replaced = true;
+    safeSend(prevWs, { type: 'kicked', reason: 'replaced_by_new_login', utc: nowUtcIso() });
+  } catch (_) {}
+  try { prevWs.close(4001, 'replaced_by_new_login'); } catch (_) {}
+}
+
+function parseJson(data) {
+  try { return JSON.parse(data.toString('utf8')); } catch { return null; }
+}
+
+/** Creates a fallback actionId when legacy clients omit it. */
+function ensureActionId(msg) {
+  const a = (msg && typeof msg.actionId === 'string') ? msg.actionId.trim() : '';
+  if (a) return a;
+  const utc = (msg && typeof msg.utc === 'string') ? msg.utc : nowUtcIso();
+  return 'legacy_' + utc.replace(/[^0-9TZ]/g, '') + '_' + Math.random().toString(16).slice(2);
+}
+
+async function promoteWaitingNextHand(sessionId, tableId) {
+  // Promote paid waiters into active players between hands (after a hand fully ends).
+  try {
+    const [rows] = await pool.query(
+      `SELECT sp.user_id AS userId, u.username AS username, sp.seat_index AS seatIndex, sp.total_score AS totalScore
+       FROM session_players sp
+       JOIN users u ON u.id = sp.user_id
+       WHERE sp.session_id=? AND sp.status='waiting_next_hand'
+       ORDER BY sp.seat_index ASC, sp.user_id ASC`,
+      [sessionId]
+    );
+    await pool.query(
+      `UPDATE session_players
+       SET status='joined', updated_at_utc=NOW(6)
+       WHERE session_id=? AND status='waiting_next_hand'`,
+      [sessionId]
+    );
+    for (const r of (rows || [])) {
+      await logTableEvent({
+        tableId,
+        eventType: EVT.PLAYER_JOIN_NEXT_HAND,
+        userId: Number(r.userId),
+        username: String(r.username),
+        payload: {
+          sessionId: Number(sessionId),
+          seatIndex: r.seatIndex == null ? null : Number(r.seatIndex),
+          startScore: Number(r.totalScore || 0)
+        }
+      });
+    }
+  } catch (_) {
+    // ignore
+  }
+}
+
+
+async function loadNextHandEligiblePlayers(sessionId, tableId) {
+  const sid = Number(sessionId);
+  const tid = Number(tableId);
+
+  debugWs('loadNextHandEligiblePlayers.begin', { sessionId: sid, tableId: tid });
+
+  const [tableRes, playerRes] = await Promise.all([
+    pool.query(
+      `SELECT min_players_to_start AS min_start FROM tables WHERE id=? LIMIT 1`,
+      [tid]
+    ),
+    pool.query(
+      `SELECT sp.user_id AS userId, u.username AS username, sp.seat_index AS seatIndex,
+              sp.total_score AS totalScore, sp.busted AS busted, sp.status AS joinStatus
+       FROM session_players sp
+       JOIN users u ON u.id = sp.user_id
+       WHERE sp.session_id=?
+         AND sp.status IN ('joined','disconnected_waiting','waiting_next_hand')
+         AND sp.seat_index IS NOT NULL
+       ORDER BY sp.seat_index ASC, sp.user_id ASC`,
+      [sid]
+    )
+  ]);
+
+  const tableRows = Array.isArray(tableRes) ? tableRes[0] : [];
+  const rows = Array.isArray(playerRes) ? playerRes[0] : [];
+  const minStart = Math.max(2, Number((tableRows && tableRows[0] && tableRows[0].min_start) || 2));
+  const players = (rows || []).map(r => ({
+    userId: Number(r.userId),
+    username: String(r.username),
+    seatIndex: normalizeSeatIndex(r.seatIndex),
+    penalty: Number(r.totalScore || 0),
+    busted: !!r.busted,
+    joinStatus: String(r.joinStatus || ''),
+  })).filter(p => p.seatIndex !== null && !p.busted);
+
+  debugWs('loadNextHandEligiblePlayers.result', {
+    sessionId: sid,
+    tableId: tid,
+    minStart: Number(minStart),
+    rawPlayerCount: Array.isArray(rows) ? rows.length : 0,
+    eligiblePlayerCount: players.length,
+    players: players.map(p => ({
+      userId: Number(p.userId),
+      username: String(p.username),
+      seatIndex: normalizeSeatIndex(p.seatIndex),
+      penalty: Number(p.penalty || 0),
+      busted: !!p.busted,
+      joinStatus: String(p.joinStatus || '')
+    }))
+  });
+
+  return { minStart, players };
+}
+
+
+async function loadTableMinStart(tableId) {
+  const tid = Number(tableId);
+  if (!Number.isFinite(tid) || tid <= 0) return 2;
+  try {
+    const [rows] = await pool.query(
+      `SELECT min_players_to_start AS min_start FROM tables WHERE id=? LIMIT 1`,
+      [tid]
+    );
+    return Math.max(2, Number((rows && rows[0] && rows[0].min_start) || 2));
+  } catch (_) {
+    return 2;
+  }
+}
+
+
+function isReadyEligibleJoinStatus(joinStatus) {
+  return ['joined', 'disconnected_waiting', 'waiting_next_hand'].includes(String(joinStatus || ''));
+}
+
+function isDbReadyLikePlayer(row) {
+  const seatIndex = normalizeSeatIndex(row && row.seatIndex !== undefined ? row.seatIndex : row && row.seat_index);
+  const buyIn = Number((row && (row.buyIn !== undefined ? row.buyIn : row.buy_in)) || 0);
+  const joinStatus = String((row && (row.joinStatus !== undefined ? row.joinStatus : row.status)) || '');
+  return seatIndex !== null && buyIn > 0 && isReadyEligibleJoinStatus(joinStatus);
+}
+
+function isStatePlayerReadyLike(player) {
+  if (!player) return false;
+  return !!player.ready || isDbReadyLikePlayer(player);
+}
+
+function isStartEligibleStatePlayer(player) {
+  if (!player) return false;
+  return (
+    isReadyEligibleJoinStatus(player.joinStatus) &&
+    normalizeSeatIndex(player.seatIndex) !== null &&
+    !player.busted &&
+    isStatePlayerReadyLike(player)
+  );
+}
+
+async function readyBuyInTx({ sessionId, tableId, userId, hands }) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [uRows] = await conn.query('SELECT id, chips_balance, status FROM users WHERE id=? FOR UPDATE', [userId]);
+    const u = uRows && uRows[0];
+    if (!u) { await conn.rollback(); return { ok:false, code:'USER_NOT_FOUND' }; }
+    if (String(u.status) !== 'active') { await conn.rollback(); return { ok:false, code:'USER_INACTIVE' }; }
+
+    const [tRows] = await conn.query('SELECT id, min_buy_in, max_players, status FROM tables WHERE id=? FOR UPDATE', [tableId]);
+    const t = tRows && tRows[0];
+    if (!t) { await conn.rollback(); return { ok:false, code:'TABLE_NOT_FOUND' }; }
+    if (String(t.status) !== 'open') { await conn.rollback(); return { ok:false, code:'TABLE_CLOSED' }; }
+    const buyIn = Number(t.min_buy_in || 0);
+    const maxPlayers = Number(t.max_players || 0);
+
+    const [sRows] = await conn.query('SELECT id, status, pot_total FROM table_sessions WHERE id=? LIMIT 1 FOR UPDATE', [sessionId]);
+    const sess = sRows && sRows[0];
+    if (!sess) { await conn.rollback(); return { ok:false, code:'NO_SESSION' }; }
+
+    const [spRows] = await conn.query(
+      `SELECT id, seat_index, buy_in, status, total_score
+       FROM session_players
+       WHERE session_id=? AND user_id=?
+       ORDER BY id DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [sessionId, userId]
+    );
+    const sp = spRows && spRows[0];
+    if (!sp) { await conn.rollback(); return { ok:false, code:'NOT_IN_SESSION' }; }
+    if (String(sp.status) === 'kicked') { await conn.rollback(); return { ok:false, code:'KICKED' }; }
+
+    const potTotalBefore = Number(sess.pot_total || 0);
+    const existingBuyIn = Number(sp.buy_in || 0);
+    const hasSeat = sp.seat_index !== null && sp.seat_index !== undefined;
+    const alreadyPaid = existingBuyIn > 0 && hasSeat && isReadyEligibleJoinStatus(sp.status);
+    const h = hands.get(sessionId);
+    const inRunningHand = !!(h && h.status === 'dealt' && h.phase !== 'FINISHED');
+    if (alreadyPaid) {
+      await conn.commit();
+      return {
+        ok:true,
+        code: String(sp.status) === 'waiting_next_hand' ? 'WAITING_NEXT_HAND_RESTORED' : 'READY_RESTORED',
+        seatIndex: Number(sp.seat_index),
+        buyIn: 0,
+        buyInCharged: 0,
+        existingBuyIn,
+        potTotalBefore,
+        potTotalAfter: potTotalBefore,
+        startScore: Number(sp.total_score || 0)
+      };
+    }
+
+    const [seatRows] = await conn.query(
+      `SELECT seat_index FROM session_players
+       WHERE session_id=? AND status IN ('joined','disconnected_waiting','waiting_next_hand') AND seat_index IS NOT NULL
+       FOR UPDATE`,
+      [sessionId]
+    );
+    const used = new Set();
+    for (const r of seatRows || []) used.add(Number(r.seat_index));
+    let seatIndex = null;
+    for (let i = 0; i < maxPlayers; i++) { if (!used.has(i)) { seatIndex = i; break; } }
+    if (seatIndex === null) { await conn.rollback(); return { ok:false, code:'TABLE_FULL' }; }
+
+    const balance = Number(u.chips_balance || 0);
+    if (balance < buyIn) { await conn.rollback(); return { ok:false, code:'INSUFFICIENT_CHIPS' }; }
+    const newBalance = balance - buyIn;
+
+    let startScore = 0;
+    if (inRunningHand) {
+      const [mxRows] = await conn.query(
+        `SELECT COALESCE(MAX(total_score), 0) AS mx
+         FROM session_players
+         WHERE session_id=? AND status IN ('joined','disconnected_waiting')`,
+        [sessionId]
+      );
+      startScore = mxRows && mxRows[0] ? Number(mxRows[0].mx || 0) : 0;
+    }
+
+    await conn.query('UPDATE users SET chips_balance=? WHERE id=? LIMIT 1', [newBalance, userId]);
+    const potTotal = potTotalBefore + buyIn;
+    await conn.query('UPDATE table_sessions SET pot_total=?, updated_at_utc=NOW(6) WHERE id=? LIMIT 1', [potTotal, sessionId]);
+    await conn.query(
+      `INSERT INTO chip_ledger (user_id, delta, reason, ref_type, ref_id, balance_after, created_at_utc)
+       VALUES (?, ?, ?, ?, ?, ?, NOW(6))`,
+      [userId, -buyIn, inRunningHand ? 'table_buy_in_next_hand' : 'table_buy_in_ready', 'table_session', sessionId, newBalance]
+    );
+    await conn.query(
+      `UPDATE session_players
+       SET status=?, seat_index=?, buy_in=?, total_score=?, busted=0, updated_at_utc=NOW(6)
+       WHERE session_id=? AND user_id=? LIMIT 1`,
+      [inRunningHand ? 'waiting_next_hand' : 'joined', seatIndex, buyIn, startScore, sessionId, userId]
+    );
+
+    await conn.commit();
+    return { ok:true, code: inRunningHand ? 'WAITING_NEXT_HAND' : 'READY_OK', seatIndex, buyIn, buyInCharged: buyIn, existingBuyIn: buyIn, potTotalBefore, potTotalAfter: potTotal, startScore };
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) {}
+    return { ok:false, code:'DB_ERROR', error:String(e && e.message ? e.message : e) };
+  } finally {
+    try { conn.release(); } catch (_) {}
+  }
+}
+
+async function refundAndLeaveWaitingTx({ sessionId, userId }) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [sRows] = await conn.query('SELECT id, pot_total FROM table_sessions WHERE id=? LIMIT 1 FOR UPDATE', [sessionId]);
+    const sess = sRows && sRows[0];
+    if (!sess) { await conn.rollback(); return { ok:false, code:'NO_SESSION' }; }
+    const [spRows] = await conn.query(
+      `SELECT id, buy_in FROM session_players
+       WHERE session_id=? AND user_id=?
+       ORDER BY id DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [sessionId, userId]
+    );
+    const sp = spRows && spRows[0];
+    if (!sp) { await conn.rollback(); return { ok:false, code:'NOT_IN_SESSION' }; }
+    const refund = Number(sp.buy_in || 0);
+    if (refund > 0) {
+      const [uRows] = await conn.query('SELECT chips_balance FROM users WHERE id=? FOR UPDATE', [userId]);
+      const bal = uRows && uRows[0] ? Number(uRows[0].chips_balance || 0) : 0;
+      const newBalance = bal + refund;
+      await conn.query('UPDATE users SET chips_balance=? WHERE id=? LIMIT 1', [newBalance, userId]);
+      await conn.query('UPDATE table_sessions SET pot_total=?, updated_at_utc=NOW(6) WHERE id=? LIMIT 1', [Math.max(0, Number(sess.pot_total || 0) - refund), sessionId]);
+      await conn.query(
+        `INSERT INTO chip_ledger (user_id, delta, reason, ref_type, ref_id, balance_after, created_at_utc)
+         VALUES (?, ?, ?, ?, ?, ?, NOW(6))`,
+        [userId, refund, 'table_buy_in_refund_waiting', 'table_session', sessionId, newBalance]
+      );
+    }
+    await conn.query(
+      `UPDATE session_players
+       SET status='left', left_at_utc=?, disconnected_at_utc=NULL, kick_vote_open_utc=NULL, seat_index=NULL, buy_in=0, total_score=0, busted=0, updated_at_utc=NOW(6)
+       WHERE session_id=? AND user_id=? LIMIT 1`,
+      [nowUtcIso(), sessionId, userId]
+    );
+    await conn.commit();
+    return { ok:true, refund };
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) {}
+    return { ok:false, code:'DB_ERROR', error:String(e && e.message ? e.message : e) };
+  } finally {
+    try { conn.release(); } catch (_) {}
+  }
+}
+
+async function createNextWaitingSessionTx({ tableId, oldSessionId }) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [ins] = await conn.query(
+      `INSERT INTO table_sessions (table_id, status, pot_total, hand_no, created_at_utc, updated_at_utc)
+       VALUES (?, 'waiting', 0, 0, NOW(6), NOW(6))`,
+      [tableId]
+    );
+    const newSessionId = Number(ins.insertId);
+    const [rows] = await conn.query(
+      `SELECT user_id, seat_index
+       FROM session_players
+       WHERE session_id=? AND status IN ('joined','disconnected_waiting','waiting_next_hand')
+       ORDER BY CASE WHEN seat_index IS NULL THEN 1 ELSE 0 END ASC, seat_index ASC, user_id ASC`,
+      [oldSessionId]
+    );
+    for (const r of rows || []) {
+      await conn.query(
+        `INSERT INTO session_players (session_id, user_id, seat_index, buy_in, status, joined_at_utc, total_score, busted)
+         VALUES (?, ?, NULL, 0, 'joined', NOW(6), 0, 0)`,
+        [newSessionId, Number(r.user_id)]
+      );
+    }
+    await conn.commit();
+    return { ok:true, newSessionId };
+  } catch (e) {
+    try { await conn.rollback(); } catch (_) {}
+    return { ok:false, code:'DB_ERROR', error:String(e && e.message ? e.message : e) };
+  } finally {
+    try { conn.release(); } catch (_) {}
+  }
+}
+
+async function moveRoomToNewSession({ rooms, oldSessionId, newSessionId, tableId }) {
+  const oldSet = rooms._rooms.get(String(oldSessionId));
+  if (!oldSet) return;
+  const [seatRows] = await pool.query(
+    `SELECT user_id, seat_index
+     FROM session_players
+     WHERE session_id=? AND status IN ('joined','disconnected_waiting','waiting_next_hand')`,
+    [newSessionId]
+  );
+  const seatByUser = new Map();
+  for (const r of (seatRows || [])) seatByUser.set(Number(r.user_id), normalizeSeatIndex(r.seat_index));
+  const list = Array.from(oldSet);
+  for (const ws of list) {
+    try { rooms.leave(oldSessionId, ws); } catch (_) {}
+    try {
+      ws._meta = ws._meta || {};
+      ws._meta.sessionId = newSessionId;
+      ws._meta.seatIndex = null;
+      ws._meta.ready = false;
+      rooms.join(newSessionId, ws);
+      safeSend(ws, {
+        type: 'session_reset',
+        tableId: Number(tableId),
+        oldSessionId: Number(oldSessionId),
+        sessionId: Number(newSessionId),
+        seatIndex: null,
+        spectator: true,
+        mustReadyAgain: true,
+        utc: nowUtcIso()
+      });
+    } catch (_) {}
+  }
+}
+
+async function startNextHandIfPossible({ rooms, hands, sessionId, tableId }) {
+  const sid = Number(sessionId);
+  const tid = Number(tableId);
+
+  try {
+    debugWs('startNextHandIfPossible.begin', { sessionId: sid, tableId: tid });
+    const { minStart, players } = await loadNextHandEligiblePlayers(sid, tid);
+    const current = hands.get(sid);
+    debugWs('startNextHandIfPossible.state', {
+      sessionId: sid,
+      tableId: tid,
+      currentStatus: current ? String(current.status || '') : null,
+      currentPhase: current ? String(current.phase || '') : null,
+      minStart: Number(minStart),
+      eligiblePlayerCount: players.length,
+      players: players.map(p => ({
+        userId: Number(p.userId),
+        username: String(p.username),
+        seatIndex: normalizeSeatIndex(p.seatIndex),
+        penalty: Number(p.penalty || 0),
+        busted: !!p.busted,
+        joinStatus: String(p.joinStatus || '')
+      }))
+    });
+    if (current && current.status === 'dealt' && current.phase !== 'FINISHED') {
+      debugWs('startNextHandIfPossible.skip_active_hand', {
+        sessionId: sid,
+        tableId: tid,
+        currentStatus: String(current.status || ''),
+        currentPhase: String(current.phase || '')
+      });
+      return true;
+    }
+
+    if (players.length < minStart) {
+      debugWs('startNextHandIfPossible.waiting_not_enough_players', {
+        sessionId: sid,
+        tableId: tid,
+        minStart: Number(minStart),
+        eligiblePlayerCount: players.length,
+        players: players.map(p => ({
+          userId: Number(p.userId),
+          username: String(p.username),
+          seatIndex: normalizeSeatIndex(p.seatIndex),
+          joinStatus: String(p.joinStatus || ''),
+          busted: !!p.busted
+        }))
+      });
+      await pool.query("UPDATE table_sessions SET status='waiting', updated_at_utc=NOW(6) WHERE id=? LIMIT 1", [sid]);
+      clearStartVotes(sid);
+      const snap = await getSessionSnapshot(sid);
+      if (snap) rooms.broadcast(sid, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+      const rs = await buildReadyState(rooms, sid, tid);
+      rooms.broadcast(sid, { type: 'ready_state', ...rs }, null);
+      return false;
+    }
+
+    // Keep ready flags across hands so finished hands do not force players back into ready/start flow.
+    clearStartVotes(sid);
+    const hand = hands.startHand(sid, tid, players);
+    debugWs('startNextHandIfPossible.started', {
+      sessionId: sid,
+      tableId: tid,
+      handId: hand && hand.handId ? String(hand.handId) : null,
+      eligiblePlayerCount: players.length,
+      minStart: Number(minStart)
+    });
+    await pool.query("UPDATE table_sessions SET status='active', hand_no=hand_no+1, updated_at_utc=NOW(6) WHERE id=? LIMIT 1", [sid]);
+    await logTableEvent({
+      tableId: tid,
+      eventType: EVT.HAND_STARTED,
+      handId: hand.handId,
+      payload: {
+        sessionId: sid,
+        handId: String(hand.handId),
+        autoStarted: true,
+        minStart: Number(minStart),
+        players: players.map(p => ({
+          userId: Number(p.userId),
+          username: String(p.username),
+          seatIndex: normalizeSeatIndex(p.seatIndex),
+          penalty: Number(p.penalty || 0),
+          busted: !!p.busted,
+          joinStatus: String(p.joinStatus || 'joined'),
+        }))
+      }
+    });
+    rooms.broadcast(sid, { type: 'hand_start', handId: hand.handId, utc: nowUtcIso() }, null);
+    const ps = hands.publicState(sid);
+    if (ps) rooms.broadcast(sid, { type: 'state_update', publicState: ps, utc: nowUtcIso() }, null);
+    const set = rooms._rooms.get(String(sid));
+    if (set) {
+      for (const c of set) {
+        if (!c._meta || !c._meta.userId) continue;
+        const cards = hands.getHoleCards(sid, c._meta.userId);
+        if (cards) safeSend(c, { type:'your_hand', handId: hand.handId, cards, myHoleCards: cards, utc: nowUtcIso() });
+      }
+    }
+    const snap = await getSessionSnapshot(sid);
+    if (snap) rooms.broadcast(sid, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+    const rs = await buildReadyState(rooms, sid, tid);
+    rooms.broadcast(sid, { type: 'ready_state', ...rs }, null);
+    return true;
+  } catch (e) {
+    try { console.error('[startNextHandIfPossible]', { sessionId: sid, tableId: tid, error: String(e && e.message ? e.message : e) }); } catch (_) {}
+    return false;
+  }
+}
+
+async function buildReadyState(rooms, sessionId, tableId) {
+  // DB authoritative player list (keeps seats even when disconnected)
+  const [rows] = await pool.query(
+    `SELECT sp.user_id AS userId, u.username AS username, sp.seat_index AS seatIndex, sp.buy_in AS buyIn, sp.status AS joinStatus, sp.total_score AS totalScore, sp.busted AS busted
+     FROM session_players sp
+     JOIN users u ON u.id = sp.user_id
+     WHERE sp.session_id=?
+       AND (
+         (sp.status IN ('joined','disconnected_waiting','waiting_next_hand') AND sp.seat_index IS NOT NULL)
+         OR (sp.status='joined' AND sp.seat_index IS NULL)
+       )
+     ORDER BY CASE WHEN sp.seat_index IS NULL THEN 1 ELSE 0 END ASC, sp.seat_index ASC, sp.user_id ASC`,
+    [sessionId]
+  );
+
+  const readyUserIds = [];
+  const players = [];
+
+  const sid = String(sessionId);
+  const readyMap = sessionReady.get(sid) || new Map();
+
+  for (const r of (rows || [])) {
+    const userId = Number(r.userId);
+    const joinStatus = String(r.joinStatus || '');
+    const seatIndex = normalizeSeatIndex(r.seatIndex);
+    const pres = getPresence(sessionId, userId);
+    const readyFromDb = isDbReadyLikePlayer(r);
+    const readyFromMemory = !!readyMap.get(String(userId));
+    const ready = readyFromDb || readyFromMemory;
+    const busted = !!r.busted;
+    players.push({
+      userId,
+      username: String(r.username),
+      seatIndex,
+      buyIn: Number(r.buyIn || 0),
+      ready,
+      connected: !!pres.connected,
+      joinStatus,
+      penalty: Number(r.totalScore || 0),
+      busted,
+      eliminated: busted,
+      statusLabel: busted ? 'elendi' : null,
+    });
+    if (ready && seatIndex !== null && !busted && isReadyEligibleJoinStatus(joinStatus)) readyUserIds.push(userId);
+  }
+
+  const startUserIds = [];
+  const startSet = sessionStartVotes.get(sid) || new Set();
+  for (const p of players) {
+    if (p.seatIndex !== null && p.ready && !p.busted && isReadyEligibleJoinStatus(p.joinStatus) && startSet.has(String(p.userId))) {
+      startUserIds.push(p.userId);
+    }
+  }
+
+  return { sessionId: Number(sessionId), tableId: Number(tableId), readyUserIds, startUserIds, players, utc: nowUtcIso() };
+}
+
+
+/**
+ * Ready tracker (persists across disconnects):
+ * - sessionReady: Map<sessionId, Map<userId, boolean>>
+ */
+const sessionReady = new Map();
+
+// Per-session start votes (manual start gate)
+const sessionStartVotes = new Map();
+
+function clearStartVote(sessionId, userId) {
+  const sid = String(sessionId);
+  const uid = String(userId);
+  const set = sessionStartVotes.get(sid);
+  if (!set) return;
+  set.delete(uid);
+  if (set.size === 0) sessionStartVotes.delete(sid);
+}
+
+function clearStartVotes(sessionId) {
+  sessionStartVotes.delete(String(sessionId));
+}
+
+function setReadyFlag(sessionId, userId, ready) {
+  const sid = String(sessionId);
+  const uid = String(userId);
+  if (!sessionReady.has(sid)) sessionReady.set(sid, new Map());
+  sessionReady.get(sid).set(uid, !!ready);
+}
+
+function clearReadyFlags(sessionId) {
+  try { sessionReady.delete(String(sessionId)); } catch (_) {}
+}
+
+function buildReadyLogPayload(paid, sessionId) {
+  return {
+    sessionId: Number(sessionId),
+    seatIndex: paid && paid.seatIndex == null ? null : Number(paid.seatIndex),
+    buyInCharged: Number((paid && paid.buyInCharged) || 0),
+    existingBuyIn: Number((paid && paid.existingBuyIn) || 0),
+    sessionPotTotalBefore: Number((paid && paid.potTotalBefore) || 0),
+    sessionPotTotalAfter: Number((paid && paid.potTotalAfter) || 0),
+    startScore: Number((paid && paid.startScore) || 0)
+  };
+}
+
+function resolveReadyLogEventType(paid) {
+  if (paid && (paid.code === 'READY_RESTORED' || paid.code === 'WAITING_NEXT_HAND_RESTORED')) {
+    return EVT.PLAYER_READY_RESTORED;
+  }
+  if (paid && (paid.code === 'WAITING_NEXT_HAND' || paid.code === 'WAITING_NEXT_HAND_RESTORED')) {
+    return EVT.PLAYER_WAITING_NEXT_HAND;
+  }
+  return EVT.PLAYER_READY_PAID;
+}
+
+/**
+ * Presence tracker:
+ * - sessionPresence: Map<sessionId, Map<userId, { connected:boolean, lastSeenUtc:string, kickTimer:any, autoTimer:any }>>
+ */
+const sessionPresence = new Map();
+
+function getPresence(sessionId, userId) {
+  const sid = String(sessionId);
+  const uid = String(userId);
+  if (!sessionPresence.has(sid)) sessionPresence.set(sid, new Map());
+  const m = sessionPresence.get(sid);
+  // New presence starts with null lastSeenUtc so first join is not misclassified as a reconnect.
+  if (!m.has(uid)) m.set(uid, { connected: false, lastSeenUtc: null, kickTimer: null, autoTimer: null });
+  return m.get(uid);
+}
+
+function clearTimer(t) {
+  if (!t) return;
+  try { clearTimeout(t); } catch (_) {}
+}
+
+function scheduleAutoPlay({ hands, rooms, sessionId, userId }) {
+  const p = getPresence(sessionId, userId);
+  clearTimer(p.autoTimer);
+
+  // Periodic check while disconnected
+  const tick = () => {
+    const pr = getPresence(sessionId, userId);
+    if (pr.connected) return;
+
+    const h = hands.get(sessionId);
+    if (!h || h.status !== 'dealt') {
+      pr.autoTimer = setTimeout(tick, 4000);
+      return;
+    }
+
+    const ps = hands.publicState(sessionId);
+    const turnSeat = ps ? Number(ps.turnSeatIndex) : null;
+    const step = ps ? String(ps.step || '') : '';
+    const seatIndex = (() => {
+      const hh = hands.get(sessionId);
+      if (!hh || !Array.isArray(hh.players)) return null;
+      const pp = hh.players.find(x => Number(x.userId) === Number(userId));
+      return pp ? Number(pp.seatIndex) : null;
+    })();
+
+    if (seatIndex !== null && turnSeat !== null && Number(seatIndex) === Number(turnSeat)) {
+      const actionId = 'auto_' + nowUtcIso().replace(/[^0-9TZ]/g, '') + '_' + Math.random().toString(16).slice(2);
+
+      if (step === 'DRAW') {
+        const res = hands.draw(sessionId, userId, actionId);
+        // ack not relevant (no ws)
+        if (res && res.ok) {
+          const pub = hands.publicState(sessionId);
+          if (pub) rooms.broadcast(sessionId, { type: 'state_update', publicState: pub, utc: nowUtcIso() }, null);
+        }
+      } else if (step === 'DISCARD') {
+        const cards = hands.getHoleCards(sessionId, userId) || [];
+        const card = cards.length ? cards[0] : '';
+        const res = hands.discard(sessionId, userId, card, actionId);
+        if (res && res.ok) {
+          const pub = hands.publicState(sessionId);
+          if (pub) rooms.broadcast(sessionId, { type: 'state_update', publicState: pub, utc: nowUtcIso() }, null);
+        }
+      }
+    }
+
+    pr.autoTimer = setTimeout(tick, 4000);
+  };
+
+  p.autoTimer = setTimeout(tick, 4000);
+}
+
+function broadcastPauseState(rooms, sessionId, reason) {
+  rooms.broadcast(sessionId, { type: 'table_paused', sessionId: Number(sessionId), reason: reason || 'player_disconnected', utc: nowUtcIso() }, null);
+}
+
+function broadcastResumeState(rooms, sessionId) {
+  rooms.broadcast(sessionId, { type: 'table_resumed', sessionId: Number(sessionId), utc: nowUtcIso() }, null);
+}
+
+async function isPlayerInSession(sessionId, userId) {
+  const [rows] = await pool.query(
+    `SELECT 1 AS ok
+     FROM session_players
+     WHERE session_id=? AND user_id=?
+       AND status IN ('joined','disconnected_waiting','waiting_next_hand')
+       AND seat_index IS NOT NULL
+     LIMIT 1`,
+    [sessionId, userId]
+  );
+  return !!(rows && rows[0]);
+}
+
+function startWsServer({ wsPort }) {
+  const rooms = new Rooms();
+  const hands = new HandManager();
+
+  const wss = new WebSocket.Server({ port: wsPort });
+
+  // Heartbeat: drop dead sockets so room state doesn't keep "ghost" players.
+  const hbInterval = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.isAlive === false) {
+        try {
+          if (ws._meta && ws._meta.sessionId) rooms.leave(ws._meta.sessionId, ws);
+        } catch (_) {}
+        try { ws.terminate(); } catch (_) {}
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch (_) {}
+    }
+  }, 30000);
+
+  wss.on('listening', () => {
+    console.log('[WS] listening on :' + wsPort);
+  });
+
+  function broadcastStateUpdate(sessionId) {
+    const ps = hands.publicState(sessionId);
+    if (!ps) return;
+    rooms.broadcast(sessionId, { type: 'state_update', publicState: ps, utc: nowUtcIso() }, null);
+  }
+
+  function sendPrivateHand(ws) {
+    if (!ws || !ws._meta || !ws._meta.sessionId || !ws._meta.userId) return;
+    const cards = hands.getHoleCards(ws._meta.sessionId, ws._meta.userId);
+    if (!cards) return;
+    safeSend(ws, {
+      type: 'your_hand',
+      handId: hands.get(ws._meta.sessionId)?.handId || null,
+      cards,
+      myHoleCards: cards,
+      utc: nowUtcIso()
+    });
+  }
+
+  async function adminKick({ sessionId, tableId, targetUserId, byUserId, reason }) {
+    // DB mark
+    await kickPlayerTx({ sessionId, userId: targetUserId, reason: reason || 'admin_kick' });
+
+    // Close ws if present
+    const k = connKey(sessionId, targetUserId);
+    const tws = activeConnByKey.get(k);
+    if (tws) {
+      try {
+        tws._meta = tws._meta || {};
+        tws._meta._replaced = true;
+        safeSend(tws, { type: 'kicked', reason: reason || 'admin_kick', utc: nowUtcIso() });
+      } catch (_) {}
+      try { tws.close(4101, 'kicked'); } catch (_) {}
+    }
+
+    // Broadcast
+    rooms.broadcast(sessionId, {
+      type: 'player_kicked',
+      sessionId: Number(sessionId),
+      tableId: Number(tableId),
+      targetUserId: Number(targetUserId),
+      byUserId: Number(byUserId),
+      reason: reason || 'admin_kick',
+      utc: nowUtcIso()
+    }, null);
+
+    const rs = await buildReadyState(rooms, sessionId, tableId);
+    rooms.broadcast(sessionId, { type: 'ready_state', ...rs }, null);
+  }
+
+  async function applyPendingKicksAtHandEnd(sessionId, tableId) {
+    let list = [];
+    try { list = hands.consumePendingKicks(sessionId); } catch (_) { list = []; }
+    if (!Array.isArray(list) || list.length === 0) return;
+    for (const k of list) {
+      try {
+        await adminKick({
+          sessionId,
+          tableId,
+          targetUserId: Number(k.targetUserId),
+          byUserId: Number(k.byUserId || 0) || 0,
+          reason: String(k.reason || 'vote_kick')
+        });
+      } catch (e) {
+        try { console.error('[applyPendingKicksAtHandEnd]', { sessionId: Number(sessionId), tableId: Number(tableId), targetUserId: Number(k && k.targetUserId), error: String(e && e.message ? e.message : e) }); } catch (_) {}
+      }
+    }
+  }
+
+  async function finalizeEndedHand({ rooms, hands, sessionId, tableId, fin }) {
+    const sid = Number(sessionId);
+    const tid = Number(tableId);
+    if (!fin || !fin.publicState) return false;
+
+    debugWs('finalizeEndedHand.begin', {
+      sessionId: sid,
+      tableId: tid,
+      winnerUserId: fin && fin.winnerUserId != null ? Number(fin.winnerUserId) : null,
+      updatesCount: Array.isArray(fin && fin.updates) ? fin.updates.length : 0,
+      publicPlayers: Array.isArray(fin && fin.publicState && fin.publicState.players)
+        ? fin.publicState.players.map(p => ({
+            userId: Number(p.userId),
+            username: String(p.username || ''),
+            penalty: Number(p.penalty || 0),
+            busted: !!p.busted,
+            seatIndex: normalizeSeatIndex(p.seatIndex)
+          }))
+        : []
+    });
+
+    rooms.broadcast(sid, { type: 'scoring_final', publicState: fin.publicState, utc: nowUtcIso() }, null);
+
+    try {
+      const ps = Array.isArray(fin.publicState.players) ? fin.publicState.players : [];
+      for (const p of ps) {
+        await pool.query(
+          `UPDATE session_players SET total_score=?, busted=?, updated_at_utc=NOW(6) WHERE session_id=? AND user_id=? LIMIT 1`,
+          [Number(p.penalty || 0), p.busted ? 1 : 0, sid, Number(p.userId)]
+        );
+      }
+    } catch (e) {
+      try { console.error('[finalizeEndedHand.persist_scores]', { sessionId: sid, tableId: tid, error: String(e && e.message ? e.message : e) }); } catch (_) {}
+    }
+
+    try {
+      await applyPendingKicksAtHandEnd(sid, tid);
+    } catch (e) {
+      try { console.error('[finalizeEndedHand.apply_kicks]', { sessionId: sid, tableId: tid, error: String(e && e.message ? e.message : e) }); } catch (_) {}
+    }
+
+    try {
+      await promoteWaitingNextHand(sid, tid);
+    } catch (e) {
+      try { console.error('[finalizeEndedHand.promote_waiters]', { sessionId: sid, tableId: tid, error: String(e && e.message ? e.message : e) }); } catch (_) {}
+    }
+
+    try {
+      const snap = await getSessionSnapshot(sid);
+      if (snap) rooms.broadcast(sid, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+      const rs = await buildReadyState(rooms, sid, tid);
+      rooms.broadcast(sid, { type: 'ready_state', ...rs }, null);
+    } catch (e) {
+      try { console.error('[finalizeEndedHand.broadcast_snapshot]', { sessionId: sid, tableId: tid, error: String(e && e.message ? e.message : e) }); } catch (_) {}
+    }
+
+    if (fin.winnerUserId) {
+      debugWs('finalizeEndedHand.winner_branch', {
+        sessionId: sid,
+        tableId: tid,
+        winnerUserId: Number(fin.winnerUserId)
+      });
+      try {
+        const payout = await payoutSessionTx({ sessionId: sid, winnerUserId: fin.winnerUserId });
+        const winner = (Array.isArray(fin.publicState.players) ? fin.publicState.players : []).find(x => Number(x.userId) === Number(fin.winnerUserId)) || null;
+        await logTableEvent({
+          tableId: tid,
+          eventType: EVT.PAYOUT_DONE,
+          userId: fin.winnerUserId,
+          username: winner ? String(winner.username || '') : null,
+          payload: {
+            sessionId: sid,
+            prize: Number((payout && payout.prize) || 0),
+            fee: Number((payout && payout.fee) || 0),
+            potTotal: Number(((payout && payout.prize) || 0) + ((payout && payout.fee) || 0))
+          }
+        });
+        await safeCloseRun({
+          tableId: tid,
+          winnerUserId: fin.winnerUserId,
+          winnerUsername: winner ? String(winner.username || '') : null,
+          potTotal: Number(((payout && payout.prize) || 0) + ((payout && payout.fee) || 0)),
+          feeTotal: Number((payout && payout.fee) || 0),
+          prizeTotal: Number((payout && payout.prize) || 0)
+        });
+      } catch (e) {
+        try { console.error('[finalizeEndedHand.payout]', { sessionId: sid, tableId: tid, winnerUserId: Number(fin.winnerUserId), error: String(e && e.message ? e.message : e) }); } catch (_) {}
+      }
+
+      clearReadyFlags(sid);
+      clearStartVotes(sid);
+
+      try {
+        const next = await createNextWaitingSessionTx({ tableId: tid, oldSessionId: sid });
+        debugWs('finalizeEndedHand.new_waiting_session', {
+          sessionId: sid,
+          tableId: tid,
+          resultOk: !!(next && next.ok),
+          newSessionId: next && next.newSessionId ? Number(next.newSessionId) : null,
+          code: next && next.code ? String(next.code) : null
+        });
+        if (next && next.ok) {
+          await moveRoomToNewSession({ rooms, oldSessionId: sid, newSessionId: next.newSessionId, tableId: tid });
+          const snap = await getSessionSnapshot(next.newSessionId);
+          if (snap) rooms.broadcast(next.newSessionId, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+          const rs = await buildReadyState(rooms, next.newSessionId, tid);
+          rooms.broadcast(next.newSessionId, { type: 'ready_state', ...rs }, null);
+        }
+      } catch (e) {
+        try { console.error('[finalizeEndedHand.create_next_waiting_session]', { sessionId: sid, tableId: tid, error: String(e && e.message ? e.message : e) }); } catch (_) {}
+      }
+      return true;
+    }
+
+    try {
+      await startNextHandIfPossible({ rooms, hands, sessionId: sid, tableId: tid });
+    } catch (e) {
+      try { console.error('[finalizeEndedHand.start_next_hand]', { sessionId: sid, tableId: tid, error: String(e && e.message ? e.message : e) }); } catch (_) {}
+    }
+    return true;
+  }
+
+  wss.on('connection', (ws, req) => {
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    ws._meta = {
+      userId: null,
+      username: null,
+      isAdmin: false,
+      tableId: null,
+      sessionId: null,
+      seatIndex: null,
+      ready: false,
+      minStart: 2,
+      ip: req && req.socket ? (req.socket.remoteAddress || 'unknown') : 'unknown',
+      _replaced: false
+    };
+
+    safeSend(ws, { type: 'hello', utc: nowUtcIso() });
+
+    ws.on('message', async (data) => {
+      const msg = parseJson(data);
+      if (!msg || typeof msg.type !== 'string') {
+        safeSend(ws, { type: 'error', code: 'BAD_JSON', utc: nowUtcIso() });
+        return;
+      }
+
+      if (msg.type === 'ping') {
+        safeSend(ws, { type: 'pong', utc: nowUtcIso() });
+        return;
+      }
+
+      if (msg.type === 'join_room') {
+        const tableId = Number(msg.tableId);
+        const token = (typeof msg.token === 'string') ? msg.token : '';
+        if (!Number.isFinite(tableId) || tableId <= 0) {
+          safeSend(ws, { type: 'error', code: 'BAD_TABLE_ID', utc: nowUtcIso() });
+          return;
+        }
+        if (!token || token.length < 10) {
+          safeSend(ws, { type: 'error', code: 'NO_TOKEN', utc: nowUtcIso() });
+          return;
+        }
+
+        const user = await wsAuthUser(token);
+        debugWs('join_room.auth_result', {
+          tableId,
+          authenticated: !!user,
+          userId: user && user.id ? Number(user.id) : null,
+          username: user && user.username ? String(user.username) : null
+        });
+        if (!user) {
+          safeSend(ws, { type: 'error', code: 'AUTH_FAIL', utc: nowUtcIso() });
+          return;
+        }
+
+        const session = await findLatestSessionForUserTable(user.id, tableId);
+        if (!session) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', message: 'Join table via HTTP first', utc: nowUtcIso() });
+          return;
+        }
+
+        const seatIndex = await getSeatForUserInSession(user.id, session.sessionId);
+
+        // Same user reconnect rule: new login replaces old WS connection (single-session).
+        const key = connKey(session.sessionId, user.id);
+        const prev = activeConnByKey.get(key);
+        if (prev && prev !== ws) {
+          kickReplaced(prev);
+        }
+        activeConnByKey.set(key, ws);
+
+        if (ws._meta.sessionId) rooms.leave(ws._meta.sessionId, ws);
+
+        ws._meta.userId = user.id;
+        ws._meta.username = user.username;
+        ws._meta.isAdmin = !!user.is_admin;
+        ws._meta.tableId = tableId;
+        ws._meta.sessionId = session.sessionId;
+        ws._meta.seatIndex = seatIndex;
+        const existingReadyMap = sessionReady.get(String(session.sessionId));
+        const existingReady = !!(existingReadyMap && existingReadyMap.get(String(user.id)));
+        ws._meta.ready = existingReady;
+
+        rooms.join(session.sessionId, ws);
+
+        // presence update
+        const sidKey = String(session.sessionId);
+        const uidKey = String(user.id);
+        const hadPresence = sessionPresence.has(sidKey) && sessionPresence.get(sidKey).has(uidKey);
+        const pres = getPresence(session.sessionId, user.id);
+        const wasDisconnected = hadPresence && pres.connected === false && !!pres.lastSeenUtc;
+        pres.connected = true;
+        pres.lastSeenUtc = nowUtcIso();
+        clearTimer(pres.kickTimer);
+        clearTimer(pres.autoTimer);
+
+        // If player was disconnected_waiting in DB, mark as rejoined and clear any pending kick vote.
+        try {
+          const [uRows] = await pool.query(
+            `SELECT status, seat_index, buy_in
+             FROM session_players
+             WHERE session_id=? AND user_id=?
+             LIMIT 1`,
+            [session.sessionId, user.id]
+          );
+          const row = (uRows && uRows[0]) ? uRows[0] : null;
+          const st = row ? String(row.status || '') : null;
+          const dbReady = isDbReadyLikePlayer(row);
+          const resolvedReady = existingReady || dbReady;
+          ws._meta.ready = resolvedReady;
+          setReadyFlag(session.sessionId, user.id, resolvedReady);
+          if (st === 'disconnected_waiting') {
+            await pool.query(
+              `UPDATE session_players
+               SET status='joined', disconnected_at_utc=NULL, kick_vote_open_utc=NULL, left_at_utc=NULL
+               WHERE session_id=? AND user_id=? LIMIT 1`,
+              [session.sessionId, user.id]
+            );
+            try {
+              await pool.query('DELETE FROM session_kick_votes WHERE session_id=? AND target_user_id=?', [session.sessionId, user.id]);
+            } catch (_) {}
+            rooms.broadcast(session.sessionId, { type: 'kick_vote_cleared', sessionId: Number(session.sessionId), targetUserId: Number(user.id), utc: nowUtcIso() }, null);
+            try { hands.clearPendingKick(session.sessionId, user.id); } catch (_) {}
+            try { broadcastStateUpdate(session.sessionId); } catch (_) {}
+          }
+        } catch (e) {
+          console.warn('[WS] rejoin db update failed', e && e.message ? e.message : e);
+        }
+
+        safeSend(ws, {
+          type: 'joined',
+          tableId,
+          sessionId: session.sessionId,
+          userId: user.id,
+          username: user.username,
+          seatIndex,
+          utc: nowUtcIso()
+        });
+
+        // DB snapshot (session + players + pot)
+        const snap = await getSessionSnapshot(session.sessionId);
+        if (snap) {
+          const snapshotMsg = { type: 'state_snapshot', ...snap, utc: nowUtcIso() };
+          safeSend(ws, snapshotMsg);
+          rooms.broadcast(session.sessionId, snapshotMsg, ws);
+          ws._meta.minStart = Number(snap.minStart || 2);
+        }
+
+        // Ready state snapshot
+        const rs = await buildReadyState(rooms, session.sessionId, tableId);
+        safeSend(ws, { type: 'ready_state', ...rs });
+        rooms.broadcast(session.sessionId, { type: 'ready_state', ...rs }, ws);
+
+        // If a hand already exists, push current state
+        const current = hands.get(session.sessionId);
+        if (current && current.status === 'dealt') {
+          broadcastStateUpdate(session.sessionId);
+          sendPrivateHand(ws);
+        }
+
+        // Broadcast join/reconnect
+        if (wasDisconnected) {
+          await logTableEvent({
+            tableId,
+            eventType: EVT.PLAYER_RECONNECTED,
+            userId: user.id,
+            username: user.username,
+            payload: { sessionId: Number(session.sessionId), seatIndex: seatIndex == null ? null : Number(seatIndex) }
+          });
+          rooms.broadcast(session.sessionId, {
+            type: 'player_reconnected',
+            userId: user.id,
+            username: user.username,
+            seatIndex,
+            utc: nowUtcIso()
+          }, ws);
+          broadcastResumeState(rooms, session.sessionId);
+        } else {
+          rooms.broadcast(session.sessionId, {
+            type: 'player_joined',
+            userId: user.id,
+            username: user.username,
+            seatIndex,
+            utc: nowUtcIso()
+          }, ws);
+        }
+
+        return;
+      }
+
+      if (msg.type === 'ready' || msg.type === 'buyin_next_hand' || msg.type === 'sit_table') {
+        const isSeatRequest = msg.type === 'sit_table';
+        debugWs('ready.begin', {
+          msgType: String(msg.type || ''),
+          sessionId: ws && ws._meta ? Number(ws._meta.sessionId || 0) : null,
+          tableId: ws && ws._meta ? Number(ws._meta.tableId || 0) : null,
+          userId: ws && ws._meta ? Number(ws._meta.userId || 0) : null,
+          requestedReady: (msg.type === 'buyin_next_hand' || isSeatRequest) ? true : ((msg.ready === undefined) ? true : !!msg.ready)
+        });
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+
+        const wantReady = (msg.type === 'buyin_next_hand' || isSeatRequest) ? true : ((msg.ready === undefined) ? true : !!msg.ready);
+        if (!wantReady) {
+          ws._meta.ready = false;
+          setReadyFlag(ws._meta.sessionId, ws._meta.userId, false);
+          try { clearStartVote(ws._meta.sessionId, ws._meta.userId); } catch (_) {}
+          safeSend(ws, { type: 'ready_ok', ready: false, utc: nowUtcIso() });
+          const rs = await buildReadyState(rooms, ws._meta.sessionId, ws._meta.tableId);
+          rooms.broadcast(ws._meta.sessionId, { type: 'ready_state', ...rs }, null);
+          return;
+        }
+
+        const paid = await readyBuyInTx({ sessionId: ws._meta.sessionId, tableId: ws._meta.tableId, userId: ws._meta.userId, hands });
+        debugWs('ready.tx_result', {
+          sessionId: Number(ws._meta.sessionId),
+          tableId: Number(ws._meta.tableId),
+          userId: Number(ws._meta.userId),
+          ok: !!paid.ok,
+          code: paid && paid.code ? String(paid.code) : null,
+          seatIndex: paid && paid.seatIndex != null ? Number(paid.seatIndex) : null,
+          buyIn: paid && paid.buyIn != null ? Number(paid.buyIn) : null,
+          waitingNextHand: !!(paid && paid.waitingNextHand),
+          restored: !!(paid && paid.restored)
+        });
+
+        if (!paid.ok) {
+          if (paid.code === 'INSUFFICIENT_CHIPS') {
+            await logTableEvent({
+              tableId: ws._meta.tableId,
+              eventType: EVT.PLAYER_READY_FAILED_BALANCE,
+              userId: ws._meta.userId,
+              username: ws._meta.username,
+              payload: { sessionId: Number(ws._meta.sessionId) }
+            });
+          }
+          safeSend(ws, { type: 'error', code: paid.code || 'READY_FAILED', message: paid.error || undefined, utc: nowUtcIso() });
+          return;
+        }
+
+        await logTableEvent({
+          tableId: ws._meta.tableId,
+          eventType: resolveReadyLogEventType(paid),
+          userId: ws._meta.userId,
+          username: ws._meta.username,
+          payload: buildReadyLogPayload(paid, ws._meta.sessionId)
+        });
+
+        ws._meta.ready = true;
+        if (paid.seatIndex !== null && paid.seatIndex !== undefined) ws._meta.seatIndex = Number(paid.seatIndex);
+        setReadyFlag(ws._meta.sessionId, ws._meta.userId, true);
+        safeSend(ws, { type: 'ready_ok', ready: true, code: paid.code, seatIndex: paid.seatIndex, buyIn: paid.buyIn, utc: nowUtcIso() });
+
+        const snap = await getSessionSnapshot(ws._meta.sessionId);
+        if (snap) rooms.broadcast(ws._meta.sessionId, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+        const rs = await buildReadyState(rooms, ws._meta.sessionId, ws._meta.tableId);
+        rooms.broadcast(ws._meta.sessionId, { type: 'ready_state', ...rs }, null);
+        return;
+      }
+
+      if (msg.type === 'leave_table') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        const h = hands.get(ws._meta.sessionId);
+        const inRunningHand = !!(h && h.status === 'dealt' && h.phase !== 'FINISHED');
+        if (inRunningHand) {
+          safeSend(ws, { type: 'error', code: 'HAND_ALREADY_STARTED', utc: nowUtcIso() });
+          return;
+        }
+        const out = await refundAndLeaveWaitingTx({ sessionId: ws._meta.sessionId, userId: ws._meta.userId });
+        if (!out.ok) {
+          safeSend(ws, { type: 'error', code: out.code || 'LEAVE_FAILED', message: out.error || undefined, utc: nowUtcIso() });
+          return;
+        }
+        await logTableEvent({
+          tableId: ws._meta.tableId,
+          eventType: EVT.PLAYER_LEFT_TABLE,
+          userId: ws._meta.userId,
+          username: ws._meta.username,
+          payload: { sessionId: Number(ws._meta.sessionId), refund: Number(out.refund || 0), seatIndex: eventSeat(ws) }
+        });
+        setReadyFlag(ws._meta.sessionId, ws._meta.userId, false);
+        try { clearStartVote(ws._meta.sessionId, ws._meta.userId); } catch (_) {}
+        safeSend(ws, { type: 'left_table', refunded: Number(out.refund || 0), utc: nowUtcIso() });
+        const snap = await getSessionSnapshot(ws._meta.sessionId);
+        if (snap) rooms.broadcast(ws._meta.sessionId, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+        const rs = await buildReadyState(rooms, ws._meta.sessionId, ws._meta.tableId);
+        rooms.broadcast(ws._meta.sessionId, { type: 'ready_state', ...rs }, null);
+        return;
+      }
+
+      if (msg.type === 'start_game') {
+        debugWs('start_game.begin', {
+          sessionId: ws && ws._meta ? Number(ws._meta.sessionId || 0) : null,
+          tableId: ws && ws._meta ? Number(ws._meta.tableId || 0) : null,
+          userId: ws && ws._meta ? Number(ws._meta.userId || 0) : null
+        });
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+
+        const stillIn = await isPlayerInSession(ws._meta.sessionId, ws._meta.userId);
+        if (!stillIn) {
+          safeSend(ws, { type: 'error', code: 'NOT_IN_SESSION', utc: nowUtcIso() });
+          return;
+        }
+
+        const sid = String(ws._meta.sessionId);
+        const current = hands.get(ws._meta.sessionId);
+        const hasActiveHand = !!(current && current.status === 'dealt' && current.phase !== 'FINISHED');
+        if (hasActiveHand) {
+          safeSend(ws, { type: 'error', code: 'HAND_ALREADY_STARTED', utc: nowUtcIso() });
+          return;
+        }
+
+        const rs = await buildReadyState(rooms, ws._meta.sessionId, ws._meta.tableId);
+        const minStart = await loadTableMinStart(ws._meta.tableId);
+        ws._meta.minStart = Number(minStart);
+        const handPlayers = rs.players.filter(isStartEligibleStatePlayer);
+        const starter = rs.players.find(p => Number(p.userId) === Number(ws._meta.userId)) || null;
+
+        if (!starter || normalizeSeatIndex(starter.seatIndex) === null) {
+          safeSend(ws, { type: 'error', code: 'SPECTATOR_CANNOT_START', utc: nowUtcIso() });
+          return;
+        }
+        if (!isStartEligibleStatePlayer(starter)) {
+          safeSend(ws, { type: 'error', code: 'NOT_READY', utc: nowUtcIso() });
+          return;
+        }
+
+        let set = sessionStartVotes.get(sid);
+        if (!set) {
+          set = new Set();
+          sessionStartVotes.set(sid, set);
+        }
+
+        const eligibleUserIds = new Set(handPlayers.map(p => String(p.userId)));
+        for (const votedUserId of Array.from(set)) {
+          if (!eligibleUserIds.has(String(votedUserId))) set.delete(String(votedUserId));
+        }
+        set.add(String(ws._meta.userId));
+
+        const startCount = Array.from(set).filter(uid => eligibleUserIds.has(String(uid))).length;
+        const readyCount = handPlayers.length;
+
+        const rsAfterVote = await buildReadyState(rooms, ws._meta.sessionId, ws._meta.tableId);
+        rooms.broadcast(ws._meta.sessionId, { type: 'ready_state', ...rsAfterVote }, null);
+
+        const canStart = (readyCount >= minStart) && (startCount >= 1);
+        debugWs('start_game.counts', {
+          sessionId: Number(ws._meta.sessionId),
+          tableId: Number(ws._meta.tableId),
+          userId: Number(ws._meta.userId),
+          minStart: Number(minStart),
+          readyCount: Number(readyCount),
+          startCount: Number(startCount),
+          canStart: !!canStart,
+          eligiblePlayers: handPlayers.map(p => ({
+            userId: Number(p.userId),
+            username: String(p.username || ''),
+            seatIndex: normalizeSeatIndex(p.seatIndex),
+            ready: isStatePlayerReadyLike(p),
+            busted: !!p.busted,
+            joinStatus: String(p.joinStatus || '')
+          }))
+        });
+        if (!canStart) {
+          safeSend(ws, {
+            type: 'start_ok',
+            readyCount: Number(readyCount),
+            startCount: Number(startCount),
+            minStart: Number(minStart),
+            utc: nowUtcIso()
+          });
+          return;
+        }
+
+        clearStartVotes(sid);
+        for (const p of handPlayers) {
+          try { setReadyFlag(ws._meta.sessionId, p.userId, true); } catch (_) {}
+        }
+        await pool.query("UPDATE table_sessions SET status='active', hand_no=hand_no+1, updated_at_utc=NOW(6) WHERE id=? LIMIT 1", [ws._meta.sessionId]);
+
+        await logTableEvent({
+          tableId: ws._meta.tableId,
+          eventType: EVT.GAME_START,
+          userId: ws._meta.userId,
+          username: ws._meta.username,
+          payload: {
+            sessionId: Number(ws._meta.sessionId),
+            minStart: Number(minStart),
+            readyCount: Number(readyCount),
+            startCount: Number(startCount),
+            startedByUserId: Number(ws._meta.userId)
+          }
+        });
+
+        const hand = hands.startHand(ws._meta.sessionId, ws._meta.tableId, handPlayers);
+        debugWs('start_game.started', {
+          sessionId: Number(ws._meta.sessionId),
+          tableId: Number(ws._meta.tableId),
+          handId: hand && hand.handId ? String(hand.handId) : null,
+          readyCount: Number(readyCount),
+          startCount: Number(startCount),
+          playerCount: handPlayers.length
+        });
+        await logTableEvent({
+          tableId: ws._meta.tableId,
+          eventType: EVT.HAND_STARTED,
+          handId: hand.handId,
+          payload: {
+            sessionId: Number(ws._meta.sessionId),
+            handId: String(hand.handId),
+            autoStarted: false,
+            players: handPlayers.map(p => ({
+              userId: Number(p.userId),
+              username: String(p.username),
+              seatIndex: normalizeSeatIndex(p.seatIndex)
+            }))
+          }
+        });
+
+        rooms.broadcast(ws._meta.sessionId, { type: 'hand_start', handId: hand.handId, utc: nowUtcIso() }, null);
+        broadcastStateUpdate(ws._meta.sessionId);
+
+        const conns = rooms._rooms.get(String(ws._meta.sessionId));
+        if (conns) {
+          for (const c of conns) sendPrivateHand(c);
+        }
+
+        try {
+          const snap = await getSessionSnapshot(ws._meta.sessionId);
+          if (snap) rooms.broadcast(ws._meta.sessionId, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+          const nextRs = await buildReadyState(rooms, ws._meta.sessionId, ws._meta.tableId);
+          rooms.broadcast(ws._meta.sessionId, { type: 'ready_state', ...nextRs }, null);
+        } catch (e) {
+          try { console.error('[start_game.broadcast_post_start]', { sessionId: Number(ws._meta.sessionId), tableId: Number(ws._meta.tableId), error: String(e && e.message ? e.message : e) }); } catch (_) {}
+        }
+        return;
+      }
+
+
+      // Admin: request kick      // Admin: request kick
+      if (msg.type === 'request_kick') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        if (!ws._meta.isAdmin) {
+          safeSend(ws, { type: 'error', code: 'ADMIN_ONLY', utc: nowUtcIso() });
+          return;
+        }
+        const targetUserId = Number(msg.targetUserId);
+        if (!Number.isFinite(targetUserId) || targetUserId <= 0) {
+          safeSend(ws, { type: 'error', code: 'BAD_TARGET', utc: nowUtcIso() });
+          return;
+        }
+        const reason = (typeof msg.reason === 'string') ? msg.reason.slice(0, 64) : 'admin_kick';
+        safeSend(ws, { type: 'action_ack', actionId: ensureActionId(msg), ok: true, utc: nowUtcIso() });
+
+        await adminKick({
+          sessionId: ws._meta.sessionId,
+          tableId: ws._meta.tableId,
+          targetUserId,
+          byUserId: ws._meta.userId,
+          reason
+        });
+        return;
+      }
+
+      // Admin: table reset + refund
+      if (msg.type === 'table_reset') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        if (!ws._meta.isAdmin) {
+          safeSend(ws, { type: 'error', code: 'ADMIN_ONLY', utc: nowUtcIso() });
+          return;
+        }
+
+        const tableId = Number(msg.tableId || ws._meta.tableId);
+        if (!Number.isFinite(tableId) || tableId <= 0) {
+          safeSend(ws, { type: 'error', code: 'BAD_TABLE_ID', utc: nowUtcIso() });
+          return;
+        }
+
+        const actionId = ensureActionId(msg);
+        safeSend(ws, { type: 'action_ack', actionId, ok: true, utc: nowUtcIso() });
+
+        const result = await resetRefundTableTx({ tableId, adminUserId: ws._meta.userId });
+
+        // Clear in-memory hand state for that session if any
+        if (result && result.sessionId) {
+          hands.clear(result.sessionId);
+        }
+
+        // Broadcast reset
+        rooms.broadcast(ws._meta.sessionId, {
+          type: 'table_reset',
+          tableId,
+          sessionId: result && result.sessionId ? Number(result.sessionId) : Number(ws._meta.sessionId),
+          refunded: result && result.refunded ? result.refunded : [],
+          utc: nowUtcIso()
+        }, null);
+
+        // Close all sockets in room so clients re-join fresh
+        const set = rooms._rooms.get(String(ws._meta.sessionId));
+        if (set) {
+          for (const c of Array.from(set)) {
+            try { c.close(4100, 'table_reset'); } catch (_) {}
+          }
+        }
+        return;
+      }
+
+      // Player: vote to kick a disconnected player (unanimous, after 5 min vote opened)
+      if (msg.type === 'kick_vote') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+
+        const targetUserId = Number(msg.targetUserId);
+        if (!Number.isFinite(targetUserId) || targetUserId <= 0) {
+          safeSend(ws, { type: 'error', code: 'BAD_TARGET', utc: nowUtcIso() });
+          return;
+        }
+
+        // voter must be an active joined player
+        const stillIn = await isPlayerInSession(ws._meta.sessionId, ws._meta.userId);
+        if (!stillIn) {
+          safeSend(ws, { type: 'error', code: 'NOT_IN_SESSION', utc: nowUtcIso() });
+          return;
+        }
+
+        // target must be disconnected_waiting and vote must be open
+        const [tRows] = await pool.query(
+          `SELECT status, kick_vote_open_utc
+           FROM session_players
+           WHERE session_id=? AND user_id=? LIMIT 1`,
+          [ws._meta.sessionId, targetUserId]
+        );
+        const t = tRows && tRows[0];
+        if (!t || String(t.status) !== 'disconnected_waiting') {
+          safeSend(ws, { type: 'error', code: 'TARGET_NOT_DISCONNECTED', utc: nowUtcIso() });
+          return;
+        }
+        if (!t.kick_vote_open_utc) {
+          safeSend(ws, { type: 'error', code: 'VOTE_NOT_OPEN', utc: nowUtcIso() });
+          return;
+        }
+
+        // record vote (idempotent)
+        try {
+          await pool.query(
+            `INSERT INTO session_kick_votes (session_id, target_user_id, voter_user_id, voted_at_utc)
+             VALUES (?,?,?,?)
+             ON DUPLICATE KEY UPDATE voted_at_utc=VALUES(voted_at_utc)`,
+            [ws._meta.sessionId, targetUserId, ws._meta.userId, nowUtcIso()]
+          );
+        } catch (e) {
+          safeSend(ws, { type: 'error', code: 'VOTE_DB_ERROR', utc: nowUtcIso() });
+          return;
+        }
+
+        // compute progress: all joined players except target must vote
+        const [[needRow]] = await pool.query(
+          `SELECT COUNT(*) AS need
+           FROM session_players
+           WHERE session_id=? AND status='joined' AND user_id<>?`,
+          [ws._meta.sessionId, targetUserId]
+        );
+        const need = needRow ? Number(needRow.need) : 0;
+
+        const [[haveRow]] = await pool.query(
+          `SELECT COUNT(*) AS have
+           FROM session_kick_votes
+           WHERE session_id=? AND target_user_id=?`,
+          [ws._meta.sessionId, targetUserId]
+        );
+        const have = haveRow ? Number(haveRow.have) : 0;
+
+        rooms.broadcast(ws._meta.sessionId, {
+          type: 'kick_vote_progress',
+          sessionId: Number(ws._meta.sessionId),
+          targetUserId: Number(targetUserId),
+          have,
+          need,
+          utc: nowUtcIso()
+        }, null);
+
+        if (need > 0 && have >= need) {
+          // Rule: do NOT kick mid-hand. Queue kick and apply after the open hand finishes.
+          const curHand = hands.get(ws._meta.sessionId);
+          const inHand = !!(curHand && curHand.status === 'dealt' && curHand.phase !== 'FINISHED');
+          if (inHand) {
+            try { hands.queuePendingKick(ws._meta.sessionId, targetUserId, ws._meta.userId, 'vote_kick'); } catch (_) {}
+            rooms.broadcast(ws._meta.sessionId, {
+              type: 'kick_scheduled',
+              sessionId: Number(ws._meta.sessionId),
+              tableId: Number(ws._meta.tableId),
+              targetUserId: Number(targetUserId),
+              byUserId: Number(ws._meta.userId),
+              when: 'end_of_hand',
+              reason: 'vote_kick',
+              utc: nowUtcIso()
+            }, null);
+            try { broadcastStateUpdate(ws._meta.sessionId); } catch (_) {}
+          } else {
+            await adminKick({
+              sessionId: ws._meta.sessionId,
+              tableId: ws._meta.tableId,
+              targetUserId,
+              byUserId: ws._meta.userId,
+              reason: 'vote_kick'
+            });
+          }
+        }
+        return;
+      }
+
+// Turn actions
+      if (msg.type === 'draw') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        const actionId = ensureActionId(msg);
+        const handBefore = hands.get(ws._meta.sessionId);
+        const drawTurnNo = handBefore ? Number(handBefore.turnNo || 0) : null;
+        const res = hands.draw(ws._meta.sessionId, ws._meta.userId, actionId);
+        safeSend(ws, res.ack);
+        if (res.ok) {
+          const handAfter = hands.get(ws._meta.sessionId);
+          await logTableEvent({
+            tableId: ws._meta.tableId,
+            handId: handAfter && handAfter.handId ? String(handAfter.handId) : null,
+            eventType: EVT.DRAW,
+            userId: ws._meta.userId,
+            username: ws._meta.username,
+            payload: {
+              sessionId: Number(ws._meta.sessionId),
+              seatIndex: eventSeat(ws),
+              turnNo: drawTurnNo,
+              source: 'deck',
+              drawnCard: formatCardLog(res.ack && res.ack.card ? res.ack.card : null),
+              handAfterCards: formatCardListForLog(res.privateCards || hands.getHoleCards(ws._meta.sessionId, ws._meta.userId) || [])
+            }
+          });
+          broadcastStateUpdate(ws._meta.sessionId);
+          sendPrivateHand(ws);
+        }
+        return;
+      }
+
+      if (msg.type === 'discard' || msg.type === 'play_card' || msg.type === 'discard_card') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        const cardId = (typeof msg.cardId === 'string') ? msg.cardId.trim() : ((typeof msg.card === 'string') ? msg.card.trim() : '');
+        const actionId = ensureActionId(msg);
+        const handBefore = hands.get(ws._meta.sessionId);
+        const discardTurnNo = handBefore ? Number(handBefore.turnNo || 0) : null;
+        const res = hands.discard(ws._meta.sessionId, ws._meta.userId, cardId, actionId);
+        safeSend(ws, res.ack);
+        if (res.ok) {
+          const handAfter = hands.get(ws._meta.sessionId);
+          await logTableEvent({
+            tableId: ws._meta.tableId,
+            handId: handAfter && handAfter.handId ? String(handAfter.handId) : null,
+            eventType: EVT.DISCARD,
+            userId: ws._meta.userId,
+            username: ws._meta.username,
+            payload: {
+              sessionId: Number(ws._meta.sessionId),
+              seatIndex: eventSeat(ws),
+              turnNo: discardTurnNo,
+              discardedCard: formatCardLog(res.ack && (res.ack.card || res.ack.cardId) ? (res.ack.card || res.ack.cardId) : cardId),
+              handAfterCards: formatCardListForLog(res.privateCards || hands.getHoleCards(ws._meta.sessionId, ws._meta.userId) || [])
+            }
+          });
+          broadcastStateUpdate(ws._meta.sessionId);
+          sendPrivateHand(ws);
+        }
+        return;
+      }
+
+      if (msg.type === 'declare_finish') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+
+        const actionId = ensureActionId(msg);
+        const res = hands.declareFinish(ws._meta.sessionId, ws._meta.userId, actionId);
+
+        safeSend(ws, res.ack);
+
+        if (res && res.ok) {
+          await logTableEvent({
+            tableId: ws._meta.tableId,
+            eventType: EVT.DECLARE_FINISH,
+            userId: ws._meta.userId,
+            username: ws._meta.username,
+            payload: { seat: eventSeat(ws) }
+          });
+        }
+
+        if (res && res.publicState) {
+          rooms.broadcast(ws._meta.sessionId, { type: 'state_update', publicState: res.publicState, utc: nowUtcIso() }, null);
+          // Send private hands so finisher can arrange.
+          const set = rooms._rooms.get(String(ws._meta.sessionId));
+          if (set) for (const c of set) sendPrivateHand(c);
+        }
+        return;
+      }
+
+
+      if (msg.type === 'finish_cancel') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        const actionId = ensureActionId(msg);
+        const res = hands.finishCancel(ws._meta.sessionId, ws._meta.userId, actionId);
+        safeSend(ws, res.ack);
+        if (res && res.publicState) {
+          rooms.broadcast(ws._meta.sessionId, { type: 'state_update', publicState: res.publicState, utc: nowUtcIso() }, null);
+          const set = rooms._rooms.get(String(ws._meta.sessionId));
+          if (set) for (const c of set) sendPrivateHand(c);
+        }
+        return;
+      }
+
+      if (msg.type === 'finish_submit') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        const actionId = ensureActionId(msg);
+        const discardCard = (typeof msg.discardCardId === 'string') ? msg.discardCardId : ((typeof msg.discardCard === 'string') ? msg.discardCard : '');
+        const groups = Array.isArray(msg.groups) ? msg.groups : [];
+        const res = hands.finishSubmit(ws._meta.sessionId, ws._meta.userId, actionId, discardCard, groups);
+
+        await logTableEvent({
+          tableId: ws._meta.tableId,
+          eventType: EVT.FINISH_SUBMIT,
+          userId: ws._meta.userId,
+          username: ws._meta.username,
+          payload: { seat: eventSeat(ws), discard: formatCardLog(discardCard), groupCount: Number(groups.length || 0) }
+        });
+
+        if (res && res.ack && res.ack.ok === false && res.ack.code === 'INVALID_FINISH_PENALTY') {
+          await logTableEvent({
+            tableId: ws._meta.tableId,
+            eventType: EVT.FINISH_INVALID_PENALTY,
+            userId: ws._meta.userId,
+            username: ws._meta.username,
+            payload: { penaltyAdd: Number(res.ack.penaltyAdd || 0), reason: res.ack.reason || null }
+          });
+        }
+        if (res && res.ack && res.ack.ok === true) {
+          await logTableEvent({
+            tableId: ws._meta.tableId,
+            eventType: EVT.FINISH_ACCEPTED,
+            userId: ws._meta.userId,
+            username: ws._meta.username,
+            payload: { discard: formatCardLog(discardCard), groupCount: Number(groups.length || 0) }
+          });
+        }
+
+        safeSend(ws, res.ack);
+
+        if (res && res.publicState) {
+          rooms.broadcast(ws._meta.sessionId, { type: 'state_update', publicState: res.publicState, utc: nowUtcIso() }, null);
+
+          // schedule: after 15s start scoring for everyone, then finalize at 120s (unless early)
+          clearPhaseTimers(ws._meta.sessionId);
+          const sid = ws._meta.sessionId;
+          const timers = {};
+          timers.show = setTimeout(() => {
+            try {
+              const ps = hands.startScoring(sid);
+              if (ps) {
+                (async () => {
+                  const finisher = (ps && Array.isArray(ps.players)) ? (ps.players.find(x => Number(x.userId) === Number(ps.finisherUserId)) || null) : null;
+                  await logTableEvent({
+                    tableId: ws._meta.tableId,
+                    eventType: EVT.SHOW_FINISH_STARTED,
+                    userId: finisher ? Number(finisher.userId) : null,
+                    username: finisher ? String(finisher.username || '') : null,
+                    payload: { sessionId: Number(sid), deadlineUtc: ps.scoringDeadlineUtc || null }
+                  });
+                })().catch(() => {});
+                rooms.broadcast(sid, { type: 'scoring_start', deadlineUtc: ps.scoringDeadlineUtc, publicState: ps, utc: nowUtcIso() }, null);
+                const set = rooms._rooms.get(String(sid));
+                if (set) for (const c of set) sendPrivateHand(c);
+
+                // schedule finalize at deadline
+                timers.finalize = setTimeout(async () => {
+                  try {
+                    const fin = hands.finalizeScoring(sid);
+                    if (fin && fin.publicState) {
+                      await logTableEvent({
+                        tableId: ws._meta.tableId,
+                        eventType: EVT.SCORING_FINALIZED,
+                        payload: { sessionId: Number(sid), winnerUserId: fin.winnerUserId == null ? null : Number(fin.winnerUserId), updates: fin.updates || [] }
+                      });
+                      await logTableEvent({
+                        tableId: ws._meta.tableId,
+                        eventType: EVT.HAND_FINISHED,
+                        payload: { sessionId: Number(sid), winnerUserId: fin.winnerUserId == null ? null : Number(fin.winnerUserId), updates: fin.updates || [] }
+                      });
+                      await finalizeEndedHand({ rooms, hands, sessionId: sid, tableId: ws._meta.tableId, fin });
+                    }
+                  } catch (e) {
+                    try { console.error('[finish_submit.finalize_timer]', { sessionId: Number(sid), tableId: Number(ws._meta.tableId), error: String(e && e.message ? e.message : e) }); } catch (_) {}
+                  }
+                }, 120_000);
+              }
+            } catch (e) {
+              try { console.error('[finish_submit.show_timer]', { sessionId: Number(sid), tableId: Number(ws._meta.tableId), error: String(e && e.message ? e.message : e) }); } catch (_) {}
+            }
+          }, 15_000);
+          phaseTimers.set(String(ws._meta.sessionId), timers);
+        }
+        return;
+      }
+
+      if (msg.type === 'scoring_submit') {
+        if (!ws._meta.sessionId || !ws._meta.userId) {
+          safeSend(ws, { type: 'error', code: 'NOT_JOINED', utc: nowUtcIso() });
+          return;
+        }
+        const actionId = ensureActionId(msg);
+        const groups = Array.isArray(msg.groups) ? msg.groups : [];
+        const res = hands.scoringSubmit(ws._meta.sessionId, ws._meta.userId, actionId, groups);
+
+        if (res && res.ack && res.ack.ok) {
+          await logTableEvent({
+            tableId: ws._meta.tableId,
+            eventType: res.ack.code === 'SCORING_SAVED_WITH_INVALID_GROUPS' ? EVT.SCORING_SAVED_WITH_INVALID_GROUPS : EVT.SCORING_SUBMIT,
+            userId: ws._meta.userId,
+            username: ws._meta.username,
+            payload: { groupCount: Number(groups.length || 0), code: res.ack.code || null }
+          });
+        }
+
+        safeSend(ws, res.ack);
+
+        if (res && res.publicState) {
+          rooms.broadcast(ws._meta.sessionId, { type: 'state_update', publicState: res.publicState, utc: nowUtcIso() }, null);
+
+          // Early finalize: if all non-busted non-finisher submitted
+          try {
+            const cur = hands.get(ws._meta.sessionId);
+            if (cur && cur.phase === 'SCORING') {
+              const finisherId = Number(cur.finisherUserId || 0);
+              const need = cur.players.filter(p => !p.busted && Number(p.userId) !== finisherId).length;
+              const have = cur.scoringSubmittedUserIds ? cur.scoringSubmittedUserIds.size : 0;
+              if (need > 0 && have >= need) {
+                // cancel finalize timer and finalize now
+                const t = phaseTimers.get(String(ws._meta.sessionId));
+                if (t && t.finalize) { try { clearTimeout(t.finalize); } catch(_) {} }
+                const fin = hands.finalizeScoring(ws._meta.sessionId);
+                if (fin && fin.publicState) {
+                  await logTableEvent({
+                    tableId: ws._meta.tableId,
+                    eventType: EVT.SCORING_FINALIZED,
+                    payload: { sessionId: Number(ws._meta.sessionId), winnerUserId: fin.winnerUserId == null ? null : Number(fin.winnerUserId), updates: fin.updates || [] }
+                  });
+                  await logTableEvent({
+                    tableId: ws._meta.tableId,
+                    eventType: EVT.HAND_FINISHED,
+                    payload: { sessionId: Number(ws._meta.sessionId), winnerUserId: fin.winnerUserId == null ? null : Number(fin.winnerUserId), updates: fin.updates || [] }
+                  });
+                  await finalizeEndedHand({ rooms, hands, sessionId: ws._meta.sessionId, tableId: ws._meta.tableId, fin });
+
+                }
+              }
+            }
+          } catch (e) {
+            try { console.error('[scoring_submit.early_finalize]', { sessionId: Number(ws._meta.sessionId), tableId: Number(ws._meta.tableId), error: String(e && e.message ? e.message : e) }); } catch (_) {}
+          }
+        }
+        return;
+      }
+
+      safeSend(ws, { type: 'error', code: 'UNKNOWN_TYPE', got: msg.type, utc: nowUtcIso() });
+    });
+
+    ws.on('close', () => {
+      // Cleanup active connection map (only if this ws is still the active one)
+      if (ws._meta && ws._meta.sessionId && ws._meta.userId) {
+        const k = connKey(ws._meta.sessionId, ws._meta.userId);
+        const cur = activeConnByKey.get(k);
+        if (cur === ws) activeConnByKey.delete(k);
+      }
+
+      if (!ws._meta || !ws._meta.sessionId) return;
+
+      const sid = ws._meta.sessionId;
+      const tableId = ws._meta.tableId;
+      const userId = ws._meta.userId;
+      const username = ws._meta.username;
+      const seatIndex = ws._meta.seatIndex;
+
+      // Replaced connections must still leave the room to avoid ghost duplicates.
+      rooms.leave(sid, ws);
+      if (ws._meta._replaced) return;
+
+      // presence: disconnected
+      if (userId) {
+        const pres = getPresence(sid, userId);
+        pres.connected = false;
+        pres.lastSeenUtc = nowUtcIso();
+
+        // Determine session status from DB (waiting vs active)
+        (async () => {
+          let sessionStatus = null;
+          try {
+            const [sRows] = await pool.query('SELECT status FROM table_sessions WHERE id=? LIMIT 1', [sid]);
+            sessionStatus = (sRows && sRows[0]) ? String(sRows[0].status) : null;
+          } catch (e) {
+            console.warn('[WS] close: cannot read session status', e && e.message ? e.message : e);
+          }
+
+          if (sessionStatus === 'active') {
+            // Active game: keep seat, wait for reconnect, open vote after 5 minutes (no auto-kick).
+            try {
+              await pool.query(
+                `UPDATE session_players
+                 SET status='disconnected_waiting', disconnected_at_utc=?, kick_vote_open_utc=NULL
+                 WHERE session_id=? AND user_id=? AND status='joined'
+                 LIMIT 1`,
+                [nowUtcIso(), sid, userId]
+              );
+            } catch (e) {
+              console.warn('[WS] close: mark disconnected_waiting failed', e && e.message ? e.message : e);
+            }
+
+            await logTableEvent({
+              tableId,
+              eventType: EVT.PLAYER_DISCONNECTED,
+              userId,
+              username,
+              payload: { sessionId: Number(sid), seatIndex: seatIndex == null ? null : Number(seatIndex) }
+            });
+
+            rooms.broadcast(sid, {
+              type: 'player_disconnected_waiting',
+              userId,
+              username,
+              seatIndex,
+              utc: nowUtcIso()
+            }, null);
+
+            try { clearStartVote(sid, userId); } catch (_) {}
+
+            clearTimer(pres.kickTimer);
+            pres.kickTimer = setTimeout(async () => {
+              const pr = getPresence(sid, userId);
+              if (pr.connected) return;
+
+              // Open vote (idempotent)
+              try {
+                await pool.query(
+                  `UPDATE session_players
+                   SET kick_vote_open_utc=COALESCE(kick_vote_open_utc, ?)
+                   WHERE session_id=? AND user_id=? AND status='disconnected_waiting'
+                   LIMIT 1`,
+                  [nowUtcIso(), sid, userId]
+                );
+
+                rooms.broadcast(sid, { type: 'kick_vote_open', sessionId: Number(sid), targetUserId: Number(userId), utc: nowUtcIso() }, null);
+              } catch (e) {
+                console.warn('[WS] open vote failed', e && e.message ? e.message : e);
+              }
+            }, 5 * 60 * 1000);
+
+            return;
+          }
+
+          // Waiting/lobby: give a short reconnect grace period before leave/refund.
+          clearTimer(pres.kickTimer);
+          pres.kickTimer = setTimeout(async () => {
+            const pr = getPresence(sid, userId);
+            if (pr.connected) return;
+
+            try {
+              const leftRes = await refundAndLeaveWaitingTx({ sessionId: sid, userId });
+              setReadyFlag(sid, userId, false);
+              try { clearStartVote(sid, userId); } catch (_) {}
+              await logTableEvent({
+                tableId,
+                eventType: EVT.PLAYER_LEFT_TABLE,
+                userId,
+                username,
+                payload: { sessionId: Number(sid), seatIndex: seatIndex == null ? null : Number(seatIndex), refund: Number((leftRes && leftRes.refund) || 0), reason: 'socket_close_waiting' }
+              });
+            } catch (e) {
+              console.warn('[WS] close: leave waiting failed', e && e.message ? e.message : e);
+            }
+
+            rooms.broadcast(sid, {
+              type: 'player_left',
+              userId,
+              username,
+              seatIndex,
+              utc: nowUtcIso()
+            }, null);
+
+            try {
+              const snap = await getSessionSnapshot(sid);
+              if (snap) rooms.broadcast(sid, { type: 'state_snapshot', ...snap, utc: nowUtcIso() }, null);
+              const rs = await buildReadyState(rooms, sid, tableId);
+              rooms.broadcast(sid, { type: 'ready_state', ...rs }, null);
+            } catch (e) {
+              console.warn('[WS] close: ready_state failed', e && e.message ? e.message : e);
+            }
+          }, 12 * 1000);
+        })();
+      }
+    });
+
+  });
+
+  wss.on('close', () => {
+    try { clearInterval(hbInterval); } catch (_) {}
+  });
+
+  return { wss, admin: { kickPlayer: adminKick } };
+}
+
+module.exports = { startWsServer };

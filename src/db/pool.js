@@ -1,0 +1,46 @@
+'use strict';
+
+/**
+ * MySQL pool bootstrap (mysql2/promise).
+ * Fix: always loads project-root .env regardless of working directory.
+ */
+
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '..', '..', '.env') });
+
+const mysql = require('mysql2/promise');
+
+function envStr(name, fallback) {
+  const v = process.env[name];
+  return (v && String(v).trim().length > 0) ? String(v) : fallback;
+}
+
+function envInt(name, fallback) {
+  const v = process.env[name];
+  const n = Number.parseInt(String(v ?? ''), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const pool = mysql.createPool({
+  host: envStr('DB_HOST', '127.0.0.1'),
+  port: envInt('DB_PORT', 3306),
+  user: envStr('DB_USER', 'root'),
+  password: envStr('DB_PASSWORD', ''),
+  database: envStr('DB_NAME', 'cardgame'),
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  charset: 'utf8mb4'
+});
+
+async function testDb() {
+  const conn = await pool.getConnection();
+  try {
+    const [rows] = await conn.query('SELECT 1 AS ok, UTC_TIMESTAMP() AS utc');
+    return rows && rows[0] ? rows[0] : { ok: 0 };
+  } finally {
+    conn.release();
+  }
+}
+
+module.exports = { pool, testDb };
