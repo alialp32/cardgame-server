@@ -1,0 +1,32 @@
+{
+  "name": "cardgame",
+  "version": "1.1.0",
+  "description": "OnCartOkey backend for Render + Railway",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "test": "echo \"No automated tests configured\" && exit 0"
+  },
+  "keywords": [
+    "okey",
+    "render",
+    "railway",
+    "websocket"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.17.4",
+    "ws": "^8.19.0"
+  }
+}
