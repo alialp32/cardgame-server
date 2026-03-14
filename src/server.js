@@ -8,10 +8,12 @@ const express = require('express');
 const cors = require('cors');
 
 const { testDb } = require('./db/pool');
+const { ensurePromoSchema } = require('./db/promo');
 const authRouter = require('./http/auth');
 const adminRouter = require('./http/admin');
 const tablesRouter = require('./http/http_tables');
 const adminLiveTable = require('./http/admin_live_table');
+const appActionsRouter = require('./http/app_actions');
 const { startWsServer } = require('./ws/server');
 const { setWsAdminApi } = require('./ws/control');
 
@@ -44,6 +46,7 @@ app.get('/db-test', async (req, res) => {
 });
 
 app.use('/auth', authRouter);
+app.use('/app', appActionsRouter);
 app.use('/admin', adminRouter);
 app.use('/admin', adminLiveTable);
 app.use('/tables', tablesRouter);
@@ -57,6 +60,10 @@ const httpServer = http.createServer(app);
 const ws = startWsServer({ server: httpServer });
 setWsAdminApi(ws && ws.admin ? ws.admin : null);
 global.WS_SERVER = ws;
+
+ensurePromoSchema()
+  .then(() => console.log('[PROMO] schema ready'))
+  .catch((err) => console.warn('[PROMO] schema init skipped:', err && err.message ? err.message : err));
 
 httpServer.listen(port, '0.0.0.0', () => {
   console.log('[HTTP+WS] listening on :' + port);

@@ -5,7 +5,14 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const express = require('express');
-const { findUser, createUser } = require('../db/queries');
+const authMw = require('./mw_auth');
+const {
+  findUser,
+  findUserById,
+  findUserByEmail,
+  findUserByGoogleSub,
+  createUser
+} = require('../db/queries');
 const { pool } = require('../db/pool');
 
 const router = express.Router();
@@ -18,6 +25,23 @@ function signAppJwt(userId) {
   );
 }
 
+function hasLocalAuth(user) {
+  return !!String(user && user.pass_hash ? user.pass_hash : '').trim();
+}
+
+function hasGoogleAuth(user) {
+  return !!String(user && user.google_sub ? user.google_sub : '').trim();
+}
+
+function computeAuthProvider(user) {
+  const local = hasLocalAuth(user);
+  const google = hasGoogleAuth(user);
+  if (local && google) return 'hybrid';
+  if (google) return 'google';
+  if (local) return 'local';
+  return String(user && user.auth_provider ? user.auth_provider : 'local');
+}
+
 function makeUserPayload(user) {
   return {
     id: Number(user.id),
@@ -26,8 +50,29 @@ function makeUserPayload(user) {
     chips_balance: Number(user.chips_balance ?? 0),
     status: String(user.status ?? 'active'),
     is_admin: Number(user.is_admin ?? 0),
-    auth_provider: String(user.auth_provider || 'local'),
+    auth_provider: computeAuthProvider(user),
     avatar_url: String(user.avatar_url || '')
+  };
+}
+
+function makeAuthMethodsPayload(user) {
+  const local = hasLocalAuth(user);
+  const google = hasGoogleAuth(user);
+  const googleEmail = google ? String(user.email || '').trim().toLowerCase() || null : null;
+  return {
+    ok: true,
+    local,
+    google,
+    googleEmail,
+    methods: {
+      local,
+      google,
+      googleEmail
+    },
+    providers: [
+      ...(local ? ['local'] : []),
+      ...(google ? ['google'] : [])
+    ]
   };
 }
 
@@ -128,14 +173,16 @@ function verifyGoogleIdToken(idToken) {
   });
 }
 
-async function findUserByGoogle(googleUser) {
+async function findGoogleLinkedUserByEmail(email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized) return null;
   const [rows] = await pool.query(
     `SELECT *
        FROM users
-      WHERE google_sub = ?
-         OR (? <> '' AND email = ?)
+      WHERE LOWER(email) = ?
+        AND COALESCE(google_sub, '') <> ''
       LIMIT 1`,
-    [googleUser.google_sub, googleUser.email, googleUser.email]
+    [normalized]
   );
   return rows[0] || null;
 }
@@ -162,25 +209,44 @@ async function createGoogleUser(googleUser) {
     [username, googleUser.google_sub, googleUser.email, googleUser.picture, passHash]
   );
 
-  const [rows] = await pool.query('SELECT * FROM users WHERE id=? LIMIT 1', [result.insertId]);
-  return rows[0] || null;
+  return findUserById(result.insertId);
 }
 
-async function updateGoogleUser(userId, googleUser) {
+async function refreshGoogleLinkedUser(userId, googleUser) {
   await pool.query(
     `UPDATE users
-        SET auth_provider='google',
-            google_sub=?,
+        SET google_sub=?,
             email=?,
             email_verified=1,
-            avatar_url=?,
+            avatar_url=CASE WHEN ? <> '' THEN ? ELSE avatar_url END,
             last_login_at_utc=UTC_TIMESTAMP(6)
       WHERE id=?`,
-    [googleUser.google_sub, googleUser.email, googleUser.picture, userId]
+    [googleUser.google_sub, googleUser.email, googleUser.picture, googleUser.picture, userId]
   );
 
-  const [rows] = await pool.query('SELECT * FROM users WHERE id=? LIMIT 1', [userId]);
-  return rows[0] || null;
+  return findUserById(userId);
+}
+
+async function linkGoogleToUser(userId, googleUser) {
+  await pool.query(
+    `UPDATE users
+        SET google_sub=?,
+            email=CASE WHEN ? <> '' THEN ? ELSE email END,
+            email_verified=CASE WHEN ? <> '' THEN 1 ELSE email_verified END,
+            avatar_url=CASE WHEN ? <> '' THEN ? ELSE avatar_url END
+      WHERE id=?`,
+    [
+      googleUser.google_sub,
+      googleUser.email,
+      googleUser.email,
+      googleUser.email,
+      googleUser.picture,
+      googleUser.picture,
+      userId
+    ]
+  );
+
+  return findUserById(userId);
 }
 
 router.post('/register', async (req, res) => {
@@ -219,10 +285,9 @@ router.post('/login', async (req, res) => {
 
     await pool.query('UPDATE users SET last_login_at_utc=UTC_TIMESTAMP(6) WHERE id=?', [user.id]);
     const token = signAppJwt(user.id);
-    const [freshRows] = await pool.query('SELECT * FROM users WHERE id=? LIMIT 1', [user.id]);
-    const freshUser = freshRows[0] || user;
+    const freshUser = await findUserById(user.id);
 
-    return res.json({ ok: true, token, user: makeUserPayload(freshUser) });
+    return res.json({ ok: true, token, user: makeUserPayload(freshUser || user) });
   } catch (err) {
     console.error('[AUTH][LOGIN][ERROR]', err);
     return res.status(500).json({ ok: false, message: 'Login sırasında sunucu hatası oluştu.' });
@@ -237,12 +302,28 @@ router.post('/google', async (req, res) => {
     }
 
     const googleUser = await verifyGoogleIdToken(idToken);
-    let user = await findUserByGoogle(googleUser);
+    let user = await findUserByGoogleSub(googleUser.google_sub);
+
+    if (!user) {
+      const preLinkedByEmail = await findGoogleLinkedUserByEmail(googleUser.email);
+      if (preLinkedByEmail) {
+        user = await refreshGoogleLinkedUser(preLinkedByEmail.id, googleUser);
+      }
+    }
+
+    if (!user) {
+      const existingLocalByEmail = await findUserByEmail(googleUser.email);
+      if (existingLocalByEmail && !hasGoogleAuth(existingLocalByEmail) && hasLocalAuth(existingLocalByEmail)) {
+        return res.status(409).json({
+          ok: false,
+          error: 'google_link_required',
+          message: 'Bu Google e-postası için yerel bir hesap var. Önce kullanıcı adı/şifre ile giriş yapıp Hesap Merkezi üzerinden Google bağla.'
+        });
+      }
+    }
 
     if (!user) {
       user = await createGoogleUser(googleUser);
-    } else {
-      user = await updateGoogleUser(user.id, googleUser);
     }
 
     if (!user) {
@@ -258,6 +339,59 @@ router.post('/google', async (req, res) => {
   } catch (err) {
     console.error('[AUTH][GOOGLE][ERROR]', err);
     return res.status(401).json({ ok: false, error: err.message || 'google_login_failed' });
+  }
+});
+
+router.get('/methods', authMw, async (req, res) => {
+  try {
+    const user = await findUserById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ ok: false, message: 'Kullanıcı bulunamadı.' });
+    }
+    return res.status(200).json(makeAuthMethodsPayload(user));
+  } catch (err) {
+    console.error('[AUTH][METHODS][ERROR]', err);
+    return res.status(500).json({ ok: false, message: 'Bağlı giriş yöntemleri alınamadı.' });
+  }
+});
+
+router.post('/google/link', authMw, async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (!idToken) {
+      return res.status(400).json({ ok: false, message: 'Google token eksik.' });
+    }
+
+    const currentUser = await findUserById(req.user.id);
+    if (!currentUser) {
+      return res.status(404).json({ ok: false, message: 'Kullanıcı bulunamadı.' });
+    }
+    if (String(currentUser.status || 'active') !== 'active') {
+      return res.status(403).json({ ok: false, message: 'Kullanıcı aktif değil.' });
+    }
+
+    const googleUser = await verifyGoogleIdToken(idToken);
+    const otherBySub = await findUserByGoogleSub(googleUser.google_sub);
+    if (otherBySub && Number(otherBySub.id) !== Number(currentUser.id)) {
+      return res.status(409).json({ ok: false, message: 'Bu Google hesabı başka bir kullanıcıya bağlı.' });
+    }
+
+    const otherByEmail = await findGoogleLinkedUserByEmail(googleUser.email);
+    if (otherByEmail && Number(otherByEmail.id) !== Number(currentUser.id)) {
+      return res.status(409).json({ ok: false, message: 'Bu Google e-postası başka bir kullanıcıya bağlı.' });
+    }
+
+    const freshUser = await linkGoogleToUser(currentUser.id, googleUser);
+    return res.status(200).json({
+      ok: true,
+      message: 'Google hesabı bağlandı.',
+      googleEmail: String(freshUser && freshUser.email ? freshUser.email : googleUser.email),
+      user: makeUserPayload(freshUser || currentUser),
+      methods: makeAuthMethodsPayload(freshUser || currentUser).methods
+    });
+  } catch (err) {
+    console.error('[AUTH][GOOGLE][LINK][ERROR]', err);
+    return res.status(401).json({ ok: false, message: err.message || 'google_link_failed' });
   }
 });
 
