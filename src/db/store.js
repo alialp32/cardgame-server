@@ -155,6 +155,14 @@ async function verifyAndGrantGooglePlayPurchase({
   await ensureStoreSchema();
 
   const normalizedToken = String(purchaseToken || '').trim();
+  console.log('[STORE_VERIFY] begin', {
+    userId: Number(userId || 0),
+    packageName: String(packageName || '').trim() || null,
+    resolvedPackageName: String(getExpectedPackageName(packageName) || '').trim() || null,
+    productId: String(productId || '').trim() || null,
+    purchaseTokenTail: normalizedToken.slice(-10),
+    orderId: String(orderId || '').trim() || null,
+  });
   const normalizedProductId = String(productId || '').trim();
   const normalizedPackageName = getExpectedPackageName(packageName);
 
@@ -174,6 +182,11 @@ async function verifyAndGrantGooglePlayPurchase({
   }
 
   const existing = await getPurchaseRecordByToken(normalizedToken);
+  console.log('[STORE_VERIFY] existing_record', {
+    exists: !!existing,
+    existingUserId: existing ? Number(existing.user_id) : null,
+    existingState: existing ? String(existing.purchase_state || '') : null,
+  });
   if (existing) {
     if (Number(existing.user_id) !== Number(userId)) {
       return { ok: false, status: 409, message: 'Bu satın alma başka bir kullanıcıya ait.' };
@@ -201,12 +214,23 @@ async function verifyAndGrantGooglePlayPurchase({
 
   let googlePurchase;
   try {
+    console.log('[STORE_VERIFY] calling_google', {
+      packageName: normalizedPackageName,
+      productId: normalizedProductId,
+      purchaseTokenTail: normalizedToken.slice(-10),
+    });
     googlePurchase = await getProductPurchase({
       packageName: normalizedPackageName,
       productId: normalizedProductId,
       purchaseToken: normalizedToken,
     });
   } catch (err) {
+    console.error('[STORE_VERIFY] google_call_failed', {
+      message: err && err.message ? err.message : String(err),
+      status: err && err.status ? err.status : null,
+      responseBody: err && err.responseBody ? err.responseBody : null,
+      publicMessage: err && err.publicMessage ? err.publicMessage : null,
+    });
     const publicMessage = err.publicMessage || err.message || 'Google Play doğrulaması başarısız.';
     const status = Number(err.status || 502) || 502;
     return {
@@ -217,6 +241,16 @@ async function verifyAndGrantGooglePlayPurchase({
       details: err.responseBody || null,
     };
   }
+
+  console.log('[STORE_VERIFY] google_purchase', {
+    packageName: googlePurchase.packageName || null,
+    productId: googlePurchase.productId || null,
+    orderId: googlePurchase.orderId || null,
+    purchaseState: googlePurchase.purchaseState,
+    consumptionState: googlePurchase.consumptionState,
+    acknowledgementState: googlePurchase.acknowledgementState,
+    purchaseType: googlePurchase.purchaseType,
+  });
 
   if (googlePurchase.productId && googlePurchase.productId !== normalizedProductId) {
     return { ok: false, status: 409, message: 'Google Play ürün kimliği uyuşmuyor.' };
@@ -363,6 +397,14 @@ async function verifyAndGrantGooglePlayPurchase({
     );
 
     await conn.commit();
+
+    console.log('[STORE_VERIFY] granted', {
+      userId: Number(userId),
+      productId: normalizedProductId,
+      grantedChips,
+      newBalance,
+      purchaseTokenTail: normalizedToken.slice(-10),
+    });
 
     return {
       ok: true,
