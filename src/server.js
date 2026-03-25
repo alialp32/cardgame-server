@@ -6,9 +6,9 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
-
 const { testDb } = require('./db/pool');
 const { ensurePromoSchema } = require('./db/promo');
+const { ensureStoreSchema } = require('./db/store');
 const authRouter = require('./http/auth');
 const adminRouter = require('./http/admin');
 const tablesRouter = require('./http/http_tables');
@@ -18,9 +18,9 @@ const { startWsServer } = require('./ws/server');
 const { setWsAdminApi } = require('./ws/control');
 
 function envInt(name, fallback) {
-  const v = process.env[name];
-  const n = Number.parseInt(String(v ?? ''), 10);
-  return Number.isFinite(n) ? n : fallback;
+  const value = process.env[name];
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function nowUtcIso() {
@@ -61,9 +61,19 @@ const ws = startWsServer({ server: httpServer });
 setWsAdminApi(ws && ws.admin ? ws.admin : null);
 global.WS_SERVER = ws;
 
-ensurePromoSchema()
-  .then(() => console.log('[PROMO] schema ready'))
-  .catch((err) => console.warn('[PROMO] schema init skipped:', err && err.message ? err.message : err));
+Promise.allSettled([ensurePromoSchema(), ensureStoreSchema()])
+  .then((results) => {
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        console.log('[BOOT] schema ready');
+      } else {
+        console.warn('[BOOT] schema init skipped:', result.reason && result.reason.message ? result.reason.message : result.reason);
+      }
+    }
+  })
+  .catch((err) => {
+    console.warn('[BOOT] schema init failure:', err && err.message ? err.message : err);
+  });
 
 httpServer.listen(port, '0.0.0.0', () => {
   console.log('[HTTP+WS] listening on :' + port);
