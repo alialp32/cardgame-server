@@ -45,6 +45,10 @@ async function getAndroidPublisherAccessToken() {
   }
 
   const { clientEmail, privateKey } = parseServiceAccountConfig();
+  console.log('[GOOGLE_PLAY] service_account_config', {
+    clientEmail: clientEmail || null,
+    hasPrivateKey: !!privateKey,
+  });
   if (!clientEmail || !privateKey) {
     const error = new Error('google_play_service_account_not_configured');
     error.status = 500;
@@ -106,6 +110,11 @@ async function getProductPurchase({ packageName, productId, purchaseToken }) {
   }
 
   const token = await getAndroidPublisherAccessToken();
+  console.log('[GOOGLE_PLAY] get_purchase', {
+    packageName: resolvedPackageName,
+    productId: String(productId || '').trim(),
+    purchaseTokenTail: String(purchaseToken || '').trim().slice(-10),
+  });
   const url =
     'https://androidpublisher.googleapis.com/androidpublisher/v3/applications/' +
     encodeURIComponent(resolvedPackageName) +
