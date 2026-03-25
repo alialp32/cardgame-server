@@ -30,6 +30,15 @@ router.get('/store', authMw, async (req, res) => {
 
 router.post('/store/google/verify', authMw, async (req, res) => {
   try {
+    console.log('[STORE_VERIFY] incoming', {
+      userId: Number(req.user && req.user.id),
+      productId: req.body && req.body.productId,
+      packageName: req.body && req.body.packageName,
+      envPackageName: process.env.GOOGLE_PLAY_PACKAGE_NAME || null,
+      purchaseTokenTail: String((req.body && req.body.purchaseToken) || '').slice(-10),
+      orderId: req.body && req.body.orderId ? String(req.body.orderId) : null,
+    });
+
     const result = await verifyAndGrantGooglePlayPurchase({
       userId: Number(req.user.id),
       packageName: req.body && req.body.packageName,
@@ -39,9 +48,25 @@ router.post('/store/google/verify', authMw, async (req, res) => {
       purchaseTime: req.body && req.body.purchaseTime,
     });
 
+    console.log('[STORE_VERIFY] result', {
+      userId: Number(req.user && req.user.id),
+      ok: !!result.ok,
+      status: Number(result.status || 200),
+      message: result.message || null,
+      error: result.error || null,
+      details: result.details || null,
+      alreadyProcessed: !!result.alreadyProcessed,
+      shouldConsume: !!result.shouldConsume,
+    });
+
     return res.status(Number(result.status || 200)).json(result);
   } catch (err) {
-    console.error('[APP][STORE][VERIFY][ERROR]', err);
+    console.error('[APP][STORE][VERIFY][ERROR]', {
+      message: err && err.message ? err.message : String(err),
+      stack: err && err.stack ? err.stack : null,
+      status: err && err.status ? err.status : null,
+      responseBody: err && err.responseBody ? err.responseBody : null,
+    });
     return res.status(500).json({
       ok: false,
       message: 'Google Play satın alma doğrulaması sırasında sunucu hatası oluştu.',
